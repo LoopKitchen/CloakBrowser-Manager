@@ -51,12 +51,33 @@ describe("ProfileFilesButton", () => {
     expect(screen.getByText(/Uploads — dd-testmerchant/)).toBeTruthy();
   });
 
+  it("uploads every chosen file, not just the first", () => {
+    const { onUpload } = renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    const a = new File([new Uint8Array([1])], "a.csv");
+    const b = new File([new Uint8Array([2])], "b.csv");
+    fireEvent.change(screen.getByTestId("profile-file-input"), { target: { files: [a, b] } });
+    expect(onUpload).toHaveBeenCalledWith([a, b]);
+  });
+
+  it("names itself for a screen reader without collapsing to the badge count", () => {
+    renderButton();
+    expect(screen.getByLabelText("Profile files, 1 file")).toBeTruthy();
+  });
+
+  it("refreshes as soon as the panel opens instead of waiting for the poll", () => {
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    renderButton({ onRefresh });
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
   it("uploads the chosen file", () => {
     const { onUpload } = renderButton();
     fireEvent.click(screen.getByTitle("Files available to this profile"));
     const chosen = new File([new Uint8Array([1])], "menu.csv", { type: "text/csv" });
     fireEvent.change(screen.getByTestId("profile-file-input"), { target: { files: [chosen] } });
-    expect(onUpload).toHaveBeenCalledWith(chosen);
+    expect(onUpload).toHaveBeenCalledWith([chosen]);
   });
 
   it("removes a file", () => {

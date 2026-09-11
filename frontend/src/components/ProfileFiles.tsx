@@ -15,40 +15,94 @@ export function formatSize(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
+/** One file on its way into a profile. Survives the panel being closed. */
+export interface Transfer {
+  id: string;
+  name: string;
+  state: "uploading" | "done" | "failed";
+  error?: string;
+  file: File;
+}
+
 /** Files attached to one profile, shared by the toolbar panel and the drop target. */
 export function useProfileFiles(profileId: string) {
   const [files, setFiles] = useState<ProfileFile[]>([]);
-  const [uploading, setUploading] = useState(false);
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // A list response that started before a mutation describes a world that no longer exists.
+  const mutations = useRef(0);
+  const listing = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (listing.current) return; // single-flight: a slow poll must not stack up
+    listing.current = true;
+    const generation = mutations.current;
     try {
-      setFiles(await api.listProfileFiles(profileId));
+      const next = await api.listProfileFiles(profileId);
+      if (generation === mutations.current) setFiles(next);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to list files");
+    } finally {
+      listing.current = false;
     }
   }, [profileId]);
 
-  const upload = useCallback(
-    async (file: File) => {
-      setUploading(true);
+  const uploadFiles = useCallback(
+    async (chosen: File[]) => {
       setError(null);
-      try {
-        const added = await api.uploadProfileFile(profileId, file);
-        setFiles((prev) => [added, ...prev.filter((f) => f.id !== added.id)]);
-        return added;
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Upload failed");
-      } finally {
-        setUploading(false);
+      // Sequential on purpose: each upload is bounded server-side and the order is the
+      // order the user dropped them in.
+      for (const file of chosen) {
+        const id = `${Date.now()}-${file.name}-${Math.random().toString(36).slice(2, 8)}`;
+        setTransfers((prev) => [...prev, { id, name: file.name, state: "uploading", file }]);
+        mutations.current += 1;
+        try {
+          const added = await api.uploadProfileFile(profileId, file);
+          setFiles((prev) => [added, ...prev.filter((f) => f.id !== added.id)]);
+          setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, state: "done" } : t)));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Upload failed";
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === id ? { ...t, state: "failed", error: message } : t)),
+          );
+        }
       }
     },
     [profileId],
   );
 
+  const dismissTransfer = useCallback(
+    (id: string) => setTransfers((prev) => prev.filter((t) => t.id !== id)),
+    [],
+  );
+
+  const retryTransfer = useCallback(
+    async (id: string) => {
+      const transfer = transfers.find((t) => t.id === id);
+      if (!transfer) return;
+      dismissTransfer(id);
+      await uploadFiles([transfer.file]);
+    },
+    [transfers, dismissTransfer, uploadFiles],
+  );
+
+  // A finished upload announces itself, then gets out of the way. Failures stay put.
+  useEffect(() => {
+    const done = transfers.filter((t) => t.state === "done");
+    if (done.length === 0) return;
+    const timer = setTimeout(
+      () => setTransfers((prev) => prev.filter((t) => t.state !== "done")),
+      6000,
+    );
+    return () => clearTimeout(timer);
+  }, [transfers]);
+
+  const uploading = transfers.some((t) => t.state === "uploading");
+
   const remove = useCallback(
     async (fileId: string) => {
       try {
+        mutations.current += 1;
         await api.deleteProfileFile(profileId, fileId);
         setFiles((prev) => prev.filter((f) => f.id !== fileId));
       } catch (err) {
@@ -62,7 +116,11 @@ export function useProfileFiles(profileId: string) {
     refresh();
   }, [refresh]);
 
-  return { files, uploading, error, refresh, upload, remove, clearError: () => setError(null) };
+  return {
+    files, transfers, uploading, error, refresh,
+    uploadFiles, remove, dismissTransfer, retryTransfer,
+    clearError: () => setError(null),
+  };
 }
 
 interface ProfileFilesButtonProps {
@@ -71,7 +129,7 @@ interface ProfileFilesButtonProps {
   files: ProfileFile[];
   uploading: boolean;
   error: string | null;
-  onUpload: (file: File) => Promise<unknown>;
+  onUpload: (files: File[]) => Promise<void>;
   onRemove: (fileId: string) => Promise<void>;
   onRefresh: () => Promise<void>;
   onClearError: () => void;
@@ -114,13 +172,14 @@ export function ProfileFilesButton({
   // A download started in the browser lands here on its own; poll so it appears while open.
   useEffect(() => {
     if (!open) return;
+    void onRefresh();
     const timer = setInterval(() => void onRefresh(), 2000);
     return () => clearInterval(timer);
   }, [open, onRefresh]);
 
   const pick = async (list: FileList | null) => {
-    const chosen = list?.[0];
-    if (chosen) await onUpload(chosen);
+    const chosen = list ? Array.from(list) : [];
+    if (chosen.length) await onUpload(chosen);
     if (inputRef.current) inputRef.current.value = "";
   };
 
@@ -130,6 +189,7 @@ export function ProfileFilesButton({
         ref={inputRef}
         type="file"
         className="hidden"
+        multiple
         onChange={(e) => pick(e.target.files)}
         data-testid="profile-file-input"
       />
@@ -139,6 +199,7 @@ export function ProfileFilesButton({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-label={`Profile files, ${files.length} ${files.length === 1 ? "file" : "files"}`}
         title="Files available to this profile"
         className={`relative p-1 ${open || files.length ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
       >
@@ -148,7 +209,10 @@ export function ProfileFilesButton({
           <FileUp className="h-3.5 w-3.5" />
         )}
         {files.length > 0 && !uploading && (
-          <span className="absolute -right-1 -top-1 rounded-full bg-accent px-1 text-[9px] font-medium leading-[14px] text-white">
+          <span
+            aria-hidden="true"
+            className="absolute -right-1 -top-1 rounded-full bg-accent px-1 text-[9px] font-medium leading-[14px] text-white"
+          >
             {files.length}
           </span>
         )}

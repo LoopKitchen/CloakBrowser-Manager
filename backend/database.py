@@ -91,10 +91,37 @@ def _create_artifacts_table(conn: sqlite3.Connection) -> None:
             kind TEXT NOT NULL DEFAULT 'upload',
             state TEXT NOT NULL DEFAULT 'ready',
             content_type TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            picker_name TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_profile ON artifacts(profile_id)")
+    # Added after the first release; an existing table needs the column back-filled.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+    if "picker_name" not in columns:
+        conn.execute("ALTER TABLE artifacts ADD COLUMN picker_name TEXT")
+        _backfill_picker_names(conn)
+
+
+def _backfill_picker_names(conn: sqlite3.Connection) -> None:
+    """Give every existing artifact a picker name that is unique within its profile.
+
+    Copying ``name`` verbatim would hand two same-named files one entry, so one of them would
+    silently vanish from the file chooser. Oldest wins the plain name.
+    """
+    rows = conn.execute(
+        "SELECT id, profile_id, name FROM artifacts ORDER BY profile_id, created_at, id"
+    ).fetchall()
+    taken: dict[str, set[str]] = {}
+    for row in rows:
+        used = taken.setdefault(row["profile_id"], set())
+        stem, dot, ext = row["name"].partition(".")
+        candidate, counter = row["name"], 1
+        while candidate in used:
+            candidate = f"{stem} ({counter}){dot}{ext}"
+            counter += 1
+        used.add(candidate)
+        conn.execute("UPDATE artifacts SET picker_name = ? WHERE id = ?", (candidate, row["id"]))
 
 
 def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
@@ -369,7 +396,9 @@ def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str
 # ── Artifacts ────────────────────────────────────────────────────────────────
 
 
-_ARTIFACT_COLUMNS = ("id", "profile_id", "name", "size", "kind", "state", "content_type", "created_at")
+_ARTIFACT_COLUMNS = (
+    "id", "profile_id", "name", "size", "kind", "state", "content_type", "created_at", "picker_name",
+)
 
 
 def new_artifact_id() -> str:
@@ -385,11 +414,13 @@ def create_artifact(
     kind: str = "upload",
     state: str = "ready",
     content_type: str | None = None,
+    picker_name: str | None = None,
 ) -> dict[str, Any]:
     """Record an artifact whose bytes are already on disk. Callers publish the file first."""
     values = {
         "id": artifact_id, "profile_id": profile_id, "name": name, "size": size,
         "kind": kind, "state": state, "content_type": content_type, "created_at": _now(),
+        "picker_name": picker_name or name,
     }
     with get_db() as conn:
         cols = ", ".join(_ARTIFACT_COLUMNS)
@@ -420,7 +451,10 @@ def list_artifacts(profile_id: str) -> list[dict[str, Any]]:
 
 
 def update_artifact(profile_id: str, artifact_id: str, **fields: Any) -> dict[str, Any] | None:
-    allowed = {k: v for k, v in fields.items() if k in ("name", "size", "state", "content_type")}
+    allowed = {
+        k: v for k, v in fields.items()
+        if k in ("name", "size", "state", "content_type", "picker_name")
+    }
     if not allowed:
         return get_artifact(profile_id, artifact_id)
     assignments = ", ".join(f"{column} = ?" for column in allowed)
@@ -431,6 +465,13 @@ def update_artifact(profile_id: str, artifact_id: str, **fields: Any) -> dict[st
         )
         conn.commit()
     return get_artifact(profile_id, artifact_id)
+
+
+def profile_ids_with_artifacts() -> list[str]:
+    """Only these profiles have a file-chooser view worth reconciling at startup."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT DISTINCT profile_id FROM artifacts").fetchall()
+    return [row["profile_id"] for row in rows]
 
 
 def delete_artifact(profile_id: str, artifact_id: str) -> bool:

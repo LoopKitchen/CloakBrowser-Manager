@@ -161,3 +161,68 @@ def test_a_download_in_flight_is_listed_but_not_servable(app_client: TestClient,
     resp = app_client.get(f"/api/profiles/{pid}/files/{artifact_id}")
     assert resp.status_code == 409
     assert "still in progress" in resp.json()["detail"]
+
+
+def test_a_download_over_the_size_cap_is_refused_at_publication(
+    profile: dict, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(artifacts, "MAX_ARTIFACT_BYTES", 8)
+    tracker = downloads.DownloadTracker(profile["id"])
+    artifact_id = tracker.begin("guid-1", "huge.csv")
+    _stage(profile["id"], "guid-1", b"x" * 64)
+
+    tracker.progress("guid-1", "completed", received_bytes=64)
+
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+    assert not (downloads.staging_dir(profile["id"]) / "guid-1").exists()
+    assert not artifacts.artifact_path(profile["id"], artifact_id, "huge.csv").exists()
+
+
+def test_a_runaway_download_is_cancelled_mid_flight(
+    profile: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """Declining to record it would not stop Chromium filling the disk."""
+    monkeypatch.setattr(artifacts, "MAX_ARTIFACT_BYTES", 8)
+    cancelled: list[str] = []
+    tracker = downloads.DownloadTracker(profile["id"], cancel=cancelled.append)
+    artifact_id = tracker.begin("guid-1", "huge.csv")
+    _stage(profile["id"], "guid-1", b"x" * 64)
+
+    tracker.progress("guid-1", "inProgress", received_bytes=64)
+
+    assert cancelled == ["guid-1"]
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+    assert not (downloads.staging_dir(profile["id"]) / "guid-1").exists()
+
+
+def test_an_in_progress_download_under_the_cap_is_left_alone(profile: dict):
+    cancelled: list[str] = []
+    tracker = downloads.DownloadTracker(profile["id"], cancel=cancelled.append)
+    artifact_id = tracker.begin("guid-1", "fine.csv")
+
+    tracker.progress("guid-1", "inProgress", received_bytes=1024)
+
+    assert cancelled == []
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "pending"
+
+
+def test_downloads_interrupted_by_a_restart_are_failed_not_left_pending(profile: dict):
+    tracker = downloads.DownloadTracker(profile["id"])
+    artifact_id = tracker.begin("guid-1", "half.csv")
+    _stage(profile["id"], "guid-1", b"partial")
+
+    # A new browser cannot resume the old one's transfers.
+    assert downloads.reconcile_interrupted(profile["id"]) == 1
+
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+    assert list(downloads.staging_dir(profile["id"]).iterdir()) == []
+
+
+def test_reconcile_leaves_finished_downloads_alone(profile: dict):
+    tracker = downloads.DownloadTracker(profile["id"])
+    artifact_id = tracker.begin("guid-1", "done.csv")
+    _stage(profile["id"], "guid-1", b"ok")
+    tracker.progress("guid-1", "completed", 2)
+
+    assert downloads.reconcile_interrupted(profile["id"]) == 0
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "ready"

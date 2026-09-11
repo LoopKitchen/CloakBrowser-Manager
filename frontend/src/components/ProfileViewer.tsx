@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardCopy, Maximize2, Minimize2 } from "lucide-react";
+import { AlertCircle, CheckCircle2, ClipboardCopy, Loader2, Maximize2, Minimize2, X } from "lucide-react";
 import { api } from "../lib/api";
 import { CdpEndpointButton } from "./CdpEndpointButton";
 import { ProfileFilesButton, useProfileFiles } from "./ProfileFiles";
@@ -57,8 +57,10 @@ export function ProfileViewer({
     e.preventDefault();
     dragDepth.current = 0;
     setDragging(false);
-    const dropped = e.dataTransfer.files?.[0];
-    if (dropped) await files.upload(dropped);
+    // Every dropped file, not just the first: silently keeping one and discarding the rest
+    // looks identical to success.
+    const dropped = Array.from(e.dataTransfer.files ?? []);
+    if (dropped.length) await files.uploadFiles(dropped);
   };
 
   useEffect(() => setClipboardSync(initialClipboardSync), [initialClipboardSync]);
@@ -311,7 +313,7 @@ export function ProfileViewer({
             files={files.files}
             uploading={files.uploading}
             error={files.error}
-            onUpload={files.upload}
+            onUpload={files.uploadFiles}
             onRemove={files.remove}
             onRefresh={files.refresh}
             onClearError={files.clearError}
@@ -343,6 +345,59 @@ export function ProfileViewer({
         onDrop={onDrop}
       >
         <div ref={containerRef} className="absolute inset-0 bg-black overflow-hidden" />
+        {/* Transfer feedback lives here, not in the panel: a drop must not look like it
+            reached the web page just because the panel happens to be closed. */}
+        {files.transfers.length > 0 && (
+          <div className="absolute bottom-3 left-3 z-20 w-80 space-y-1.5">
+            {files.transfers.map((transfer) => (
+              <div
+                key={transfer.id}
+                role={transfer.state === "failed" ? "alert" : "status"}
+                className="flex items-start gap-2 rounded-md border border-border bg-surface-2/95 px-3 py-2 shadow-lg"
+              >
+                {transfer.state === "uploading" ? (
+                  <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-accent" />
+                ) : transfer.state === "done" ? (
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                ) : (
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-gray-200" title={transfer.name}>
+                    {transfer.name}
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    {transfer.state === "uploading"
+                      ? "Uploading to this profile..."
+                      : transfer.state === "done"
+                        ? `In profile files — pick it from Uploads — ${profileName} in the page's file dialog`
+                        : transfer.error}
+                  </div>
+                  {transfer.state === "failed" && (
+                    <button
+                      type="button"
+                      onClick={() => void files.retryTransfer(transfer.id)}
+                      className="mt-1 text-xs text-accent hover:underline"
+                    >
+                      Retry
+                    </button>
+                  )}
+                </div>
+                {transfer.state !== "uploading" && (
+                  <button
+                    type="button"
+                    onClick={() => files.dismissTransfer(transfer.id)}
+                    className="p-0.5 text-gray-500 hover:text-gray-300"
+                    aria-label={`Dismiss ${transfer.name}`}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
         {dragging && (
           <div className="pointer-events-none absolute inset-0 z-10 m-2 flex items-center justify-center rounded-md border-2 border-dashed border-accent bg-black/70">
             <div className="text-center">

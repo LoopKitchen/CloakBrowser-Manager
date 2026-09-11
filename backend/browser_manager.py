@@ -849,6 +849,9 @@ class BrowserManager:
             running.screenshot_task.cancel()
         if running.download_task is not None:
             running.download_task.cancel()
+            # Awaited, not just cancelled: the watcher owns staged download files, and
+            # disposal must not race its cleanup.
+            await asyncio.gather(running.download_task, return_exceptions=True)
         if close_context:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:

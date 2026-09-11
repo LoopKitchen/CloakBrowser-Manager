@@ -357,3 +357,27 @@ def test_duplicate_profile_honours_new_id(tmp_db: Path):
     assert clone["id"] == pid
     assert clone["fingerprint_seed"] == 7
     assert clone["user_data_dir"] == db.user_data_dir_for(pid)
+
+
+def test_upgrading_an_older_artifacts_table_gives_every_file_its_own_picker_name(tmp_db: Path):
+    """Two files sharing a name must not share one file-chooser entry after the upgrade."""
+    with db.get_db() as conn:
+        conn.execute("DROP TABLE artifacts")
+        conn.execute("""
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, name TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'upload',
+                state TEXT NOT NULL DEFAULT 'ready', content_type TEXT, created_at TEXT NOT NULL
+            )
+        """)
+        for artifact_id, created in (("a", "2026-01-01"), ("b", "2026-01-02"), ("c", "2026-01-03")):
+            conn.execute(
+                "INSERT INTO artifacts (id, profile_id, name, created_at) VALUES (?, 'p1', ?, ?)",
+                (artifact_id, "report.csv", created),
+            )
+        conn.commit()
+
+    db.init_db()
+
+    names = {row["id"]: row["picker_name"] for row in db.list_artifacts("p1")}
+    assert names == {"a": "report.csv", "b": "report (1).csv", "c": "report (2).csv"}

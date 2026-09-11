@@ -79,6 +79,8 @@ class ArtifactResponse(BaseModel):
     state: str
     content_type: str | None = None
     created_at: str
+    # The name this file carries in the container's file-chooser view; stable for its lifetime.
+    picker_name: str
     # Where the file is visible to the browser process, for CDP calls that take a path.
     container_path: str
 

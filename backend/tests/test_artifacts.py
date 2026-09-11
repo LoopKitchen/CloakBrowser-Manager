@@ -217,3 +217,67 @@ def test_gtk_bookmark_points_at_the_picker_view(
     line = bookmarks.read_text().strip()
     assert line.startswith(f"file://{artifacts.picker_dir(pid)} ")
     assert line.endswith("dd-testmerchant")
+
+
+def test_a_picker_name_keeps_pointing_at_the_document_it_was_given_to(
+    app_client: TestClient, tmp_db: Path
+):
+    """Two files sharing a name must not swap identities when the view is rebuilt."""
+    pid = _new_profile(app_client)
+    first = _upload(app_client, pid, "report.csv", b"FIRST").json()
+    second = _upload(app_client, pid, "report.csv", b"SECOND").json()
+
+    assert first["picker_name"] == "report.csv"
+    assert second["picker_name"] == "report (1).csv"
+    view = artifacts.picker_dir(pid)
+    # The name the first upload was given still resolves to the first upload's bytes.
+    assert (view / "report.csv").read_bytes() == b"FIRST"
+    assert (view / "report (1).csv").read_bytes() == b"SECOND"
+
+    # ...and still does after an unrelated change forces another sync.
+    _upload(app_client, pid, "other.csv", b"OTHER")
+    assert (view / "report.csv").read_bytes() == b"FIRST"
+
+
+def test_deleting_a_file_does_not_rename_its_neighbours(app_client: TestClient, tmp_db: Path):
+    pid = _new_profile(app_client)
+    first = _upload(app_client, pid, "report.csv", b"FIRST").json()
+    second = _upload(app_client, pid, "report.csv", b"SECOND").json()
+
+    app_client.delete(f"/api/profiles/{pid}/files/{first['id']}")
+
+    view = artifacts.picker_dir(pid)
+    assert not (view / "report.csv").exists()
+    # The survivor keeps the name it was given rather than being promoted onto the free one.
+    assert (view / "report (1).csv").read_bytes() == b"SECOND"
+    assert db.get_artifact(pid, second["id"])["picker_name"] == "report (1).csv"
+
+
+def test_safe_filename_fits_the_filesystem_byte_limit_and_keeps_the_extension():
+    # Three bytes per character, so 200 characters is 600 bytes — well over the 255-byte cap.
+    name = ("長" * 200) + ".csv"
+    fitted = artifacts.safe_filename(name)
+    assert len(fitted.encode("utf-8")) <= 255
+    assert fitted.endswith(".csv")
+
+
+def test_only_profiles_holding_files_are_reconciled(app_client: TestClient, tmp_db: Path):
+    """The startup repair must not walk every profile on a fleet-sized Manager."""
+    with_files = _new_profile(app_client, "Has files")
+    _new_profile(app_client, "Empty")
+    _upload(app_client, with_files)
+    assert db.profile_ids_with_artifacts() == [with_files]
+
+
+def test_startup_repair_drops_a_picker_link_whose_artifact_is_gone(
+    app_client: TestClient, tmp_db: Path
+):
+    pid = _new_profile(app_client)
+    _upload(app_client, pid, "kept.csv")
+    stale = artifacts.picker_dir(pid) / "vanished.csv"
+    stale.symlink_to(artifacts.artifact_dir(pid) / "nowhere" / "vanished.csv")
+
+    artifacts.sync_picker_view(pid)
+
+    assert not stale.is_symlink()
+    assert (artifacts.picker_dir(pid) / "kept.csv").is_symlink()

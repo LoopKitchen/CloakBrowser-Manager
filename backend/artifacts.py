@@ -7,6 +7,7 @@ not mutate a directory that a snapshot is reading.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -53,11 +54,30 @@ def artifact_path(profile_id: str, artifact_id: str, name: str) -> Path:
     return artifact_item_dir(profile_id, artifact_id) / safe_filename(name)
 
 
+# Most Linux filesystems cap a path component at 255 BYTES, not characters, so a legitimate
+# non-ASCII name can be well under 255 characters and still be rejected.
+_MAX_NAME_BYTES = 255
+
+
+def _fit_bytes(stem: str, suffix: str, budget: int) -> str:
+    """Trim ``stem`` so ``stem + suffix`` fits ``budget`` bytes, keeping the extension."""
+    suffix_bytes = len(suffix.encode("utf-8"))
+    room = max(1, budget - suffix_bytes)
+    while len(stem.encode("utf-8")) > room:
+        stem = stem[:-1]
+    return f"{stem}{suffix}" if stem else suffix[-budget:]
+
+
 def safe_filename(name: str | None, fallback: str = "file") -> str:
     """Sanitize an ORIGINAL filename kept as metadata; it never becomes a path component."""
     cleaned = unicodedata.normalize("NFC", (name or "").strip()).replace("\\", "/").rsplit("/", 1)[-1]
     cleaned = re.sub(r"[\x00-\x1f\x7f]", "", cleaned)
-    return fallback if cleaned in ("", ".", "..") else cleaned[:255]
+    if cleaned in ("", ".", ".."):
+        return fallback
+    if len(cleaned.encode("utf-8")) <= _MAX_NAME_BYTES:
+        return cleaned
+    stem, dot, ext = cleaned.rpartition(".")
+    return _fit_bytes(stem or cleaned, f"{dot}{ext}" if dot else "", _MAX_NAME_BYTES)
 
 
 def check_quota(profile_id: str, incoming: int = 0) -> None:
@@ -73,6 +93,11 @@ def check_quota(profile_id: str, incoming: int = 0) -> None:
             f"profile artifact storage would reach {used + incoming} bytes "
             f"(max {MAX_PROFILE_ARTIFACT_BYTES})"
         )
+
+
+def _flush_to_disk(handle) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
 
 
 async def save_stream(
@@ -99,10 +124,10 @@ async def save_stream(
                     raise ArtifactTooLarge(
                         f"upload exceeds {MAX_ARTIFACT_BYTES} bytes"
                     )
-                handle.write(chunk)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, artifact_path(profile_id, artifact_id, name))
+                # Off the loop: slow container storage must not stall the rest of the Manager.
+                await asyncio.to_thread(handle.write, chunk)
+            await asyncio.to_thread(_flush_to_disk, handle)
+        await asyncio.to_thread(os.replace, tmp, artifact_path(profile_id, artifact_id, name))
         return total
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -128,11 +153,17 @@ def picker_dir(profile_id: str) -> Path:
     return artifact_dir(profile_id) / PICKER_VIEW_DIRNAME
 
 
-def _unique_link(view: Path, name: str) -> Path:
-    candidate, stem, dot, ext = view / name, *name.partition(".")
-    counter = 1
-    while candidate.is_symlink() or candidate.exists():
-        candidate = view / f"{stem} ({counter}){dot}{ext}"
+def reserve_picker_name(profile_id: str, name: str) -> str:
+    """The name this artifact will keep in the file-chooser view, decided once.
+
+    Deriving it at rebuild time would let an existing picker path start resolving to a
+    DIFFERENT document once a sibling with the same name is added or removed.
+    """
+    taken = {row["picker_name"] or row["name"] for row in db.list_artifacts(profile_id)}
+    stem, dot, ext = name.partition(".")
+    candidate, counter = name, 1
+    while candidate in taken:
+        candidate = _fit_bytes(f"{stem} ({counter})", f"{dot}{ext}" if dot else "", _MAX_NAME_BYTES)
         counter += 1
     return candidate
 
@@ -160,13 +191,21 @@ def sync_picker_view(profile_id: str) -> None:
     try:
         view = picker_dir(profile_id)
         view.mkdir(parents=True, exist_ok=True)
-        for stale in view.iterdir():
-            if stale.is_symlink():
-                stale.unlink()
+        wanted: dict[str, Path] = {}
         for row in db.list_artifacts(profile_id):
             target = artifact_path(profile_id, row["id"], row["name"])
             if target.is_file():
-                _unique_link(view, row["name"]).symlink_to(target)
+                wanted[row["picker_name"] or row["name"]] = target
+        for existing in view.iterdir():
+            if not existing.is_symlink():
+                continue
+            target = wanted.get(existing.name)
+            if target is None or existing.resolve() != target.resolve():
+                existing.unlink()
+        for name, target in wanted.items():
+            link = view / name
+            if not link.is_symlink():
+                link.symlink_to(target)
         _refresh_gtk_bookmarks()
     except OSError:
         # A convenience for the human-facing dialog; an upload must never fail over it.

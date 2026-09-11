@@ -490,6 +490,10 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    # Repair pass: a crash can leave the file-chooser view out of step with the database.
+    # Scoped to profiles that actually hold files — a large fleet has thousands that do not.
+    for profile_id in db.profile_ids_with_artifacts():
+        artifacts.sync_picker_view(profile_id)
     await browser_mgr.cleanup_stale()
     # Resolve tier + pre-download the (Pro) binary before serving launches, so the
     # download never blocks a launch or auto-launch's 60s timeout.
@@ -866,7 +870,9 @@ async def upload_profile_file(profile_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=507, detail=str(exc)) from exc
 
     row = db.create_artifact(
-        artifact_id, profile_id, name, size, kind="upload", content_type=file.content_type
+        artifact_id, profile_id, name, size, kind="upload",
+        content_type=file.content_type,
+        picker_name=artifacts.reserve_picker_name(profile_id, name),
     )
     artifacts.sync_picker_view(profile_id)
     return _artifact_response(row)
