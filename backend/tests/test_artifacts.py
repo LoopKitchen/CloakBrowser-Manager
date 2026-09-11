@@ -172,3 +172,48 @@ def test_duplicate_with_browser_state_does_not_carry_artifacts(app_client: TestC
     assert app_client.get(f"/api/profiles/{clone['id']}/files").json() == []
     assert not artifacts.artifact_dir(clone["id"]).exists()
     assert Path(art["container_path"]).read_bytes() == b"secret"
+
+
+# ── file-chooser convenience view ────────────────────────────────────────────
+
+
+def test_upload_appears_under_its_real_name_in_the_picker_view(app_client: TestClient, tmp_db: Path):
+    """A page's native 'Choose File' dialog must be able to reach the file by name."""
+    pid = _new_profile(app_client)
+    art = _upload(app_client, pid, "weekly report.csv", b"payload").json()
+    link = artifacts.picker_dir(pid) / "weekly report.csv"
+    assert link.is_symlink()
+    assert link.resolve() == Path(art["container_path"]).resolve()
+    assert link.read_bytes() == b"payload"
+
+
+def test_picker_view_disambiguates_duplicate_names(app_client: TestClient, tmp_db: Path):
+    pid = _new_profile(app_client)
+    _upload(app_client, pid, "report.csv", b"one")
+    _upload(app_client, pid, "report.csv", b"two")
+    names = sorted(p.name for p in artifacts.picker_dir(pid).iterdir())
+    assert names == ["report (1).csv", "report.csv"]
+
+
+def test_picker_view_drops_a_deleted_file(app_client: TestClient, tmp_db: Path):
+    pid = _new_profile(app_client)
+    art = _upload(app_client, pid, "gone.csv").json()
+    app_client.delete(f"/api/profiles/{pid}/files/{art['id']}")
+    assert list(artifacts.picker_dir(pid).iterdir()) == []
+
+
+def test_gtk_bookmarks_are_not_written_outside_the_docker_runtime(tmp_db: Path):
+    """$HOME belongs to a real user on a native install — never touch their bookmarks."""
+    assert artifacts._gtk_bookmarks_path() is None
+
+
+def test_gtk_bookmark_points_at_the_picker_view(
+    app_client: TestClient, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    bookmarks = tmp_db / "home" / "bookmarks"
+    monkeypatch.setattr(artifacts, "_gtk_bookmarks_path", lambda: bookmarks)
+    pid = _new_profile(app_client, "dd-testmerchant")
+    _upload(app_client, pid, "menu.csv")
+    line = bookmarks.read_text().strip()
+    assert line.startswith(f"file://{artifacts.picker_dir(pid)} ")
+    assert line.endswith("dd-testmerchant")

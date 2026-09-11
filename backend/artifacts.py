@@ -110,6 +110,69 @@ async def save_stream(
         raise
 
 
+# A page's "Choose File" opens the container's own GTK dialog, which starts in an empty $HOME
+# and cannot reach an id-keyed path a human would ever type. These two helpers give that dialog
+# a flat, real-named folder per profile and a sidebar shortcut to it. Cosmetic: never fatal.
+PICKER_VIEW_DIRNAME = "files"
+
+
+def _gtk_bookmarks_path() -> Path | None:
+    """Only the Linux/Docker runtime owns the containerized GTK chooser we are bookmarking.
+    Elsewhere ``$HOME`` is a real user's, and writing there would clobber their bookmarks."""
+    if db.RUNTIME.runtime_mode != "docker":
+        return None
+    return Path.home() / ".config" / "gtk-3.0" / "bookmarks"
+
+
+def picker_dir(profile_id: str) -> Path:
+    return artifact_dir(profile_id) / PICKER_VIEW_DIRNAME
+
+
+def _unique_link(view: Path, name: str) -> Path:
+    candidate, stem, dot, ext = view / name, *name.partition(".")
+    counter = 1
+    while candidate.is_symlink() or candidate.exists():
+        candidate = view / f"{stem} ({counter}){dot}{ext}"
+        counter += 1
+    return candidate
+
+
+def _refresh_gtk_bookmarks() -> None:
+    """One sidebar entry per profile that has files, labelled with the profile name."""
+    path = _gtk_bookmarks_path()
+    if path is None:
+        return
+    lines = [
+        f"file://{picker_dir(profile['id'])} Uploads \u2014 {profile['name']}"
+        for profile in db.list_profiles()
+        if picker_dir(profile["id"]).is_dir()
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{line}\n" for line in lines))
+
+
+def sync_picker_view(profile_id: str) -> None:
+    """Rebuild the profile's flat, real-named view and the file-chooser sidebar shortcut.
+
+    Symlinks, so the bytes are stored once and the canonical id-keyed path stays the only
+    place they live.
+    """
+    try:
+        view = picker_dir(profile_id)
+        view.mkdir(parents=True, exist_ok=True)
+        for stale in view.iterdir():
+            if stale.is_symlink():
+                stale.unlink()
+        for row in db.list_artifacts(profile_id):
+            target = artifact_path(profile_id, row["id"], row["name"])
+            if target.is_file():
+                _unique_link(view, row["name"]).symlink_to(target)
+        _refresh_gtk_bookmarks()
+    except OSError:
+        # A convenience for the human-facing dialog; an upload must never fail over it.
+        pass
+
+
 def delete_file(profile_id: str, artifact_id: str) -> None:
     """Drop the artifact's whole directory — it holds exactly one file."""
     shutil.rmtree(artifact_item_dir(profile_id, artifact_id), ignore_errors=True)

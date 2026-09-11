@@ -868,6 +868,7 @@ async def upload_profile_file(profile_id: str, file: UploadFile = File(...)):
     row = db.create_artifact(
         artifact_id, profile_id, name, size, kind="upload", content_type=file.content_type
     )
+    artifacts.sync_picker_view(profile_id)
     return _artifact_response(row)
 
 
@@ -901,6 +902,7 @@ async def delete_profile_file(profile_id: str, artifact_id: str):
     if not db.delete_artifact(profile_id, artifact_id):
         raise HTTPException(status_code=404, detail="Artifact not found")
     artifacts.delete_file(profile_id, artifact_id)
+    artifacts.sync_picker_view(profile_id)
     return {"ok": True}
 
 
