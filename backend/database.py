@@ -419,6 +419,20 @@ def list_artifacts(profile_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def update_artifact(profile_id: str, artifact_id: str, **fields: Any) -> dict[str, Any] | None:
+    allowed = {k: v for k, v in fields.items() if k in ("name", "size", "state", "content_type")}
+    if not allowed:
+        return get_artifact(profile_id, artifact_id)
+    assignments = ", ".join(f"{column} = ?" for column in allowed)
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE artifacts SET {assignments} WHERE id = ? AND profile_id = ?",
+            [*allowed.values(), artifact_id, profile_id],
+        )
+        conn.commit()
+    return get_artifact(profile_id, artifact_id)
+
+
 def delete_artifact(profile_id: str, artifact_id: str) -> bool:
     with get_db() as conn:
         cur = conn.execute(

@@ -22,6 +22,7 @@ function renderButton(over: Partial<Parameters<typeof ProfileFilesButton>[0]> = 
       error={null}
       onUpload={onUpload}
       onRemove={onRemove}
+      onRefresh={vi.fn().mockResolvedValue(undefined)}
       onClearError={vi.fn()}
       {...over}
     />,
@@ -76,7 +77,7 @@ describe("ProfileFilesButton", () => {
   it("says what to do when the profile has no files", () => {
     renderButton({ files: [] });
     fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByText(/drop it straight onto the screen/)).toBeTruthy();
+    expect(screen.getByText(/drop it onto the screen, or download one in the browser/)).toBeTruthy();
   });
 
   it("Escape closes the panel and returns focus to the trigger", () => {
@@ -89,3 +90,24 @@ describe("ProfileFilesButton", () => {
     expect(document.activeElement).toBe(trigger);
   });
 });
+
+  it("shows a download still in flight, with no way to fetch it yet", () => {
+    renderButton({ files: [file({ kind: "download", state: "pending", size: 0, name: "export.xlsx" })] });
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByText("Downloading...")).toBeTruthy();
+    expect(screen.queryByTitle("Download to this computer")).toBeNull();
+    expect(screen.getByLabelText("Downloaded by the browser")).toBeTruthy();
+  });
+
+  it("shows a failed download", () => {
+    renderButton({ files: [file({ kind: "download", state: "failed" })] });
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByText("Download failed")).toBeTruthy();
+    expect(screen.queryByTitle("Download to this computer")).toBeNull();
+  });
+
+  it("marks an uploaded file differently from a downloaded one", () => {
+    renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByLabelText("Uploaded")).toBeTruthy();
+  });

@@ -313,6 +313,7 @@ export function ProfileViewer({
             error={files.error}
             onUpload={files.upload}
             onRemove={files.remove}
+            onRefresh={files.refresh}
             onClearError={files.clearError}
           />
           <button

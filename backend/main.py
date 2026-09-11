@@ -883,6 +883,8 @@ async def download_profile_file(profile_id: str, artifact_id: str):
     row = db.get_artifact(profile_id, artifact_id)
     if not row:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    if row["state"] == "pending":
+        raise HTTPException(status_code=409, detail="Download is still in progress")
     path = artifacts.artifact_path(profile_id, artifact_id, row["name"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Artifact bytes are missing")

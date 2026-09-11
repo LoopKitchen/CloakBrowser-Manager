@@ -21,6 +21,7 @@ from cloakbrowser.license import (
     read_denial_file,
 )
 
+from . import downloads
 from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
@@ -315,6 +316,7 @@ class RunningProfile:
     ws_port: int | None = None
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
+    download_task: Any = None  # asyncio.Task capturing this browser's downloads
     capture_preview: bool = True
     # Path to the wrapper's per-launch denial file (set by launch_persistent_
     # context_async on the returned context). Read on close to tell a seat/
@@ -639,6 +641,11 @@ class BrowserManager:
                     self._screenshot_loop(profile_id)
                 )
 
+            # Files this browser downloads become artifacts of the profile.
+            running.download_task = asyncio.ensure_future(
+                downloads.watch(profile_id, cdp_port)
+            )
+
             logger.info(
                 "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
                 profile_id,
@@ -840,6 +847,8 @@ class BrowserManager:
     ) -> None:
         if running.screenshot_task is not None:
             running.screenshot_task.cancel()
+        if running.download_task is not None:
+            running.download_task.cancel()
         if close_context:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:

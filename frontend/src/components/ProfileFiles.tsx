@@ -1,4 +1,4 @@
-import { Download, FileUp, Loader2, Trash2, X } from "lucide-react";
+import { Download, FileDown, FileUp, Loader2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { ProfileFile } from "../lib/api";
@@ -73,6 +73,7 @@ interface ProfileFilesButtonProps {
   error: string | null;
   onUpload: (file: File) => Promise<unknown>;
   onRemove: (fileId: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
   onClearError: () => void;
 }
 
@@ -84,6 +85,7 @@ export function ProfileFilesButton({
   error,
   onUpload,
   onRemove,
+  onRefresh,
   onClearError,
 }: ProfileFilesButtonProps) {
   const [open, setOpen] = useState(false);
@@ -108,6 +110,13 @@ export function ProfileFilesButton({
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
+
+  // A download started in the browser lands here on its own; poll so it appears while open.
+  useEffect(() => {
+    if (!open) return;
+    const timer = setInterval(() => void onRefresh(), 2000);
+    return () => clearInterval(timer);
+  }, [open, onRefresh]);
 
   const pick = async (list: FileList | null) => {
     const chosen = list?.[0];
@@ -175,24 +184,39 @@ export function ProfileFilesButton({
           <div className="max-h-64 overflow-y-auto">
             {files.length === 0 ? (
               <p className="px-3 py-4 text-xs text-gray-500">
-                No files yet. Upload one, or drop it straight onto the screen.
+                No files yet. Upload one, drop it onto the screen, or download one in the browser.
               </p>
             ) : (
               files.map((file) => (
                 <div key={file.id} className="flex items-center gap-2 px-3 py-2 hover:bg-surface-3">
+                  {file.kind === "download" ? (
+                    <FileDown className="h-3.5 w-3.5 shrink-0 text-gray-500" aria-label="Downloaded by the browser" />
+                  ) : (
+                    <FileUp className="h-3.5 w-3.5 shrink-0 text-gray-500" aria-label="Uploaded" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-xs text-gray-200" title={file.name}>
                       {file.name}
                     </div>
-                    <div className="text-[11px] text-gray-500">{formatSize(file.size)}</div>
+                    <div className="text-[11px] text-gray-500">
+                      {file.state === "pending" ? (
+                        <span className="text-accent">Downloading...</span>
+                      ) : file.state === "failed" ? (
+                        <span className="text-red-400">Download failed</span>
+                      ) : (
+                        formatSize(file.size)
+                      )}
+                    </div>
                   </div>
-                  <a
-                    href={api.profileFileUrl(profileId, file.id)}
-                    className="p-1 text-gray-500 hover:text-gray-300"
-                    title="Download to this computer"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                  </a>
+                  {file.state === "ready" && (
+                    <a
+                      href={api.profileFileUrl(profileId, file.id)}
+                      className="p-1 text-gray-500 hover:text-gray-300"
+                      title="Download to this computer"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                    </a>
+                  )}
                   <button
                     type="button"
                     onClick={() => onRemove(file.id)}
