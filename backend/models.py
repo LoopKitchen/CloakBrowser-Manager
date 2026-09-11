@@ -70,6 +70,19 @@ class ProfileUpdate(BaseModel):
         return value
 
 
+class ArtifactResponse(BaseModel):
+    id: str
+    profile_id: str
+    name: str
+    size: int
+    kind: str
+    state: str
+    content_type: str | None = None
+    created_at: str
+    # Where the file is visible to the browser process, for CDP calls that take a path.
+    container_path: str
+
+
 class ProfileDuplicateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
