@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { ClipboardCopy, Maximize2, Minimize2 } from "lucide-react";
 import { api } from "../lib/api";
 import { CdpEndpointButton } from "./CdpEndpointButton";
+import { ProfileFilesButton, useProfileFiles } from "./ProfileFiles";
 
 interface ProfileViewerProps {
   profileId: string;
   cdpUrl: string | null;
   clipboardSync: boolean;
+  profileName: string;
   onClipboardSyncChange: (enabled: boolean) => Promise<void>;
   onDisconnect: () => void;
 }
@@ -18,6 +20,7 @@ export function ProfileViewer({
   profileId,
   cdpUrl,
   clipboardSync: initialClipboardSync,
+  profileName,
   onClipboardSyncChange,
   onDisconnect,
 }: ProfileViewerProps) {
@@ -27,6 +30,36 @@ export function ProfileViewer({
   const [error, setError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [clipboardSync, setClipboardSync] = useState(initialClipboardSync);
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  const files = useProfileFiles(profileId);
+
+  // A drop onto the canvas is caught HERE, in the Manager's own page — the VNC protocol
+  // carries no files. The bytes go up over HTTP and land in this profile's file store.
+  const hasFiles = (e: React.DragEvent) => e.dataTransfer?.types?.includes("Files");
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  };
+  const onDragOver = (e: React.DragEvent) => {
+    if (hasFiles(e)) e.preventDefault();
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
+  };
+  const onDrop = async (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    const dropped = e.dataTransfer.files?.[0];
+    if (dropped) await files.upload(dropped);
+  };
 
   useEffect(() => setClipboardSync(initialClipboardSync), [initialClipboardSync]);
 
@@ -272,6 +305,16 @@ export function ProfileViewer({
         </div>
         <div className="flex items-center gap-1">
           <CdpEndpointButton cdpUrl={cdpUrl} />
+          <ProfileFilesButton
+            profileId={profileId}
+            profileName={profileName}
+            files={files.files}
+            uploading={files.uploading}
+            error={files.error}
+            onUpload={files.upload}
+            onRemove={files.remove}
+            onClearError={files.clearError}
+          />
           <button
             onClick={toggleClipboardSync}
             className={`p-1 ${clipboardSync ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
@@ -289,12 +332,27 @@ export function ProfileViewer({
         </div>
       </div>
 
-      {/* VNC canvas container */}
+      {/* VNC canvas container, doubling as a drop target for file uploads */}
       <div
-        ref={containerRef}
-        className="flex-1 bg-black overflow-hidden"
+        className="relative flex-1"
         style={{ minHeight: 0 }}
-      />
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        <div ref={containerRef} className="absolute inset-0 bg-black overflow-hidden" />
+        {dragging && (
+          <div className="pointer-events-none absolute inset-0 z-10 m-2 flex items-center justify-center rounded-md border-2 border-dashed border-accent bg-black/70">
+            <div className="text-center">
+              <p className="text-sm font-medium text-gray-100">Drop to upload to this profile</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Then pick it from Uploads — {profileName} in the page's file dialog
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

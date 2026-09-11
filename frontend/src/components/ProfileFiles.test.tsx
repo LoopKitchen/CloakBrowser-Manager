@@ -1,0 +1,91 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import type { ProfileFile } from "../lib/api";
+import { ProfileFilesButton, formatSize } from "./ProfileFiles";
+
+const file = (over: Partial<ProfileFile> = {}): ProfileFile => ({
+  id: "a1", profile_id: "p1", name: "weekly report.csv", size: 2048,
+  kind: "upload", state: "ready", content_type: "text/csv",
+  created_at: "2026-09-12T00:00:00Z", container_path: "/data/artifacts/p1/a1/weekly report.csv",
+  ...over,
+});
+
+function renderButton(over: Partial<Parameters<typeof ProfileFilesButton>[0]> = {}) {
+  const onUpload = vi.fn().mockResolvedValue(undefined);
+  const onRemove = vi.fn().mockResolvedValue(undefined);
+  render(
+    <ProfileFilesButton
+      profileId="p1"
+      profileName="dd-testmerchant"
+      files={[file()]}
+      uploading={false}
+      error={null}
+      onUpload={onUpload}
+      onRemove={onRemove}
+      onClearError={vi.fn()}
+      {...over}
+    />,
+  );
+  return { onUpload, onRemove };
+}
+
+describe("formatSize", () => {
+  it.each([[512, "512 B"], [2048, "2.0 KB"], [5 * 1024 * 1024, "5.0 MB"], [20 * 1024, "20 KB"]])(
+    "%i -> %s", (bytes, expected) => expect(formatSize(bytes as number)).toBe(expected),
+  );
+});
+
+describe("ProfileFilesButton", () => {
+  it("shows how many files the profile has", () => {
+    renderButton();
+    expect(screen.getByText("1")).toBeTruthy();
+  });
+
+  it("lists the files with their real names once opened", () => {
+    renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByText("weekly report.csv")).toBeTruthy();
+    expect(screen.getByText("2.0 KB")).toBeTruthy();
+    // The hint names the sidebar entry the page's own file dialog will show.
+    expect(screen.getByText(/Uploads — dd-testmerchant/)).toBeTruthy();
+  });
+
+  it("uploads the chosen file", () => {
+    const { onUpload } = renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    const chosen = new File([new Uint8Array([1])], "menu.csv", { type: "text/csv" });
+    fireEvent.change(screen.getByTestId("profile-file-input"), { target: { files: [chosen] } });
+    expect(onUpload).toHaveBeenCalledWith(chosen);
+  });
+
+  it("removes a file", () => {
+    const { onRemove } = renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    fireEvent.click(screen.getByLabelText("Remove weekly report.csv"));
+    expect(onRemove).toHaveBeenCalledWith("a1");
+  });
+
+  it("offers a download link straight to the bytes", () => {
+    renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByTitle("Download to this computer").getAttribute("href")).toBe(
+      "/api/profiles/p1/files/a1",
+    );
+  });
+
+  it("says what to do when the profile has no files", () => {
+    renderButton({ files: [] });
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    expect(screen.getByText(/drop it straight onto the screen/)).toBeTruthy();
+  });
+
+  it("Escape closes the panel and returns focus to the trigger", () => {
+    renderButton();
+    const trigger = screen.getByTitle("Files available to this profile");
+    fireEvent.click(trigger);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+});

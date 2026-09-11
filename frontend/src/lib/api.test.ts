@@ -97,6 +97,48 @@ describe("api.duplicateProfile", () => {
   });
 });
 
+// ── profile files ───────────────────────────────────────────────────────────
+
+describe("api profile files", () => {
+  it("uploads as multipart WITHOUT a Content-Type header", async () => {
+    const stored = { id: "a1", name: "report.csv", size: 3 };
+    mockFetch.mockResolvedValueOnce(jsonResponse(stored));
+    const file = new File([new Uint8Array([1, 2, 3])], "report.csv", { type: "text/csv" });
+
+    expect(await api.uploadProfileFile("p1", file)).toEqual(stored);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/profiles/p1/files");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
+    expect((init.body as FormData).get("file")).toBe(file);
+    // The browser must choose the multipart boundary itself.
+    expect(init.headers).toBeUndefined();
+  });
+
+  it("surfaces the server's reason when an upload is refused", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: "upload exceeds 8 bytes" }, 413));
+    await expect(api.uploadProfileFile("p1", new File([], "big.csv"))).rejects.toThrow(
+      "upload exceeds 8 bytes",
+    );
+  });
+
+  it("lists and deletes", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([{ id: "a1" }]));
+    expect(await api.listProfileFiles("p1")).toEqual([{ id: "a1" }]);
+
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.deleteProfileFile("p1", "a1");
+    expect(mockFetch).toHaveBeenLastCalledWith("/api/profiles/p1/files/a1", {
+      headers: { "Content-Type": "application/json" },
+      method: "DELETE",
+    });
+  });
+
+  it("builds a direct download URL", () => {
+    expect(api.profileFileUrl("p1", "a1")).toBe("/api/profiles/p1/files/a1");
+  });
+});
+
 // ── launchProfile ───────────────────────────────────────────────────────────
 
 describe("api.launchProfile", () => {
