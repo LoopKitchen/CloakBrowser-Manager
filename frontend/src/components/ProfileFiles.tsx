@@ -15,6 +15,22 @@ export function formatSize(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
+function sameFiles(a: ProfileFile[], b: ProfileFile[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((file, i) => {
+      const other = b[i];
+      return (
+        !!other &&
+        file.id === other.id &&
+        file.state === other.state &&
+        file.size === other.size &&
+        file.name === other.name
+      );
+    })
+  );
+}
+
 /** One file on its way into a profile. Survives the panel being closed. */
 export interface Transfer {
   id: string;
@@ -39,7 +55,10 @@ export function useProfileFiles(profileId: string) {
     const generation = mutations.current;
     try {
       const next = await api.listProfileFiles(profileId);
-      if (generation === mutations.current) setFiles(next);
+      if (generation !== mutations.current) return;
+      // Replacing the array on every poll re-renders rows the user is aiming at. Only
+      // publish a genuinely different list.
+      setFiles((prev) => (sameFiles(prev, next) ? prev : next));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to list files");
     } finally {
@@ -201,7 +220,9 @@ export function ProfileFilesButton({
         aria-expanded={open}
         aria-label={`Profile files, ${files.length} ${files.length === 1 ? "file" : "files"}`}
         title="Files available to this profile"
-        className={`relative p-1 ${open || files.length ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
+        className={`relative rounded p-1 focus:outline-none focus:ring-2 focus:ring-accent/50 ${
+          open || files.length ? "text-accent" : "text-gray-500 hover:text-gray-300"
+        }`}
       >
         {uploading ? (
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -228,8 +249,11 @@ export function ProfileFilesButton({
             <span className="text-xs font-medium text-gray-200">Files for this profile</span>
             <button
               type="button"
-              onClick={() => setOpen(false)}
-              className="text-gray-500 hover:text-gray-300"
+              onClick={() => {
+                setOpen(false);
+                triggerRef.current?.focus();
+              }}
+              className="rounded p-1 text-gray-500 hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-accent/50"
               aria-label="Close"
             >
               <X className="h-3.5 w-3.5" />
@@ -239,8 +263,13 @@ export function ProfileFilesButton({
           {error && (
             <div className="flex items-start justify-between gap-2 border-b border-border bg-red-600/10 px-3 py-2">
               <span className="text-xs text-red-400">{error}</span>
-              <button type="button" onClick={onClearError} className="text-red-400" aria-label="Dismiss error">
-                <X className="h-3 w-3" />
+              <button
+                type="button"
+                onClick={onClearError}
+                className="rounded p-1 text-red-400 focus:outline-none focus:ring-2 focus:ring-accent/50"
+                aria-label="Dismiss error"
+              >
+                <X className="h-3.5 w-3.5" />
               </button>
             </div>
           )}
@@ -275,7 +304,7 @@ export function ProfileFilesButton({
                   {file.state === "ready" && (
                     <a
                       href={api.profileFileUrl(profileId, file.id)}
-                      className="p-1 text-gray-500 hover:text-gray-300"
+                      className="rounded p-1 text-gray-500 hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-accent/50"
                       title="Download to this computer"
                     >
                       <Download className="h-3.5 w-3.5" />
@@ -284,7 +313,7 @@ export function ProfileFilesButton({
                   <button
                     type="button"
                     onClick={() => onRemove(file.id)}
-                    className="p-1 text-gray-500 hover:text-red-400"
+                    className="rounded p-1 text-gray-500 hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-accent/50"
                     title="Remove from the profile"
                     aria-label={`Remove ${file.name}`}
                   >

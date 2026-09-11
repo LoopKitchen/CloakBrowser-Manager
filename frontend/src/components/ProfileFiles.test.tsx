@@ -132,3 +132,22 @@ describe("ProfileFilesButton", () => {
     fireEvent.click(screen.getByTitle("Files available to this profile"));
     expect(screen.getByLabelText("Uploaded")).toBeTruthy();
   });
+
+describe("panel steadiness", () => {
+  it("gives its controls a real hit target, not a 14px one", () => {
+    renderButton();
+    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    for (const label of ["Close", "Remove weekly report.csv"]) {
+      expect(screen.getByLabelText(label).className).toContain("p-1");
+    }
+  });
+
+  it("Close returns focus to the trigger, like Escape does", () => {
+    renderButton();
+    const trigger = screen.getByTitle("Files available to this profile");
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByLabelText("Close"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+});
