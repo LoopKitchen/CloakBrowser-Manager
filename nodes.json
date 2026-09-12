@@ -10,7 +10,7 @@
       "depends_on": [],
       "check": "uv run python ai_ingestion/web/replay/scripts/spike_cdp_input_loop.py exits 0 and stdout prints differing before/after screenshot hashes, the flipped click flag, and a per-action latency table",
       "human_gate": false,
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "skill-schema",
@@ -26,7 +26,7 @@
       "depends_on": [],
       "check": "uv run pytest tests/web/skills/test_skill_schema.py tests/web/skills/test_skill_store.py -q green; uv run ruff check ai_ingestion/web/skills",
       "human_gate": false,
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "cloak-client-ext",
@@ -39,7 +39,7 @@
       "depends_on": [],
       "check": "uv run pytest tests/web/test_cloak_control_client.py -q green; uv run ruff check ai_ingestion/web/browser/cloak/manager_client.py",
       "human_gate": false,
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "mgr-control-lease",
@@ -54,7 +54,7 @@
       "depends_on": [],
       "check": "python -m pytest backend/tests/test_control_lease.py -q green",
       "human_gate": false,
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "mgr-screen-recorder",
