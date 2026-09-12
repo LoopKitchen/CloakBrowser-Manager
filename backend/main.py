@@ -10,22 +10,29 @@ import asyncio
 import hmac
 import logging
 import os
+import shutil
 import signal
 import struct
-import shutil
 import time
 import webbrowser
 from contextlib import asynccontextmanager
-from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+import starlette.requests
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .env_file import load_env_file
@@ -34,13 +41,14 @@ from .env_file import load_env_file
 # (database.resolve_runtime, AUTH_TOKEN, the license config below).
 load_env_file()
 
-from . import database as db
 from cloakbrowser.license import CloakBrowserLicenseError
 
+from . import database as db
+from . import recorder as teach_replay_recorder
 from .browser_manager import (
+    SCREENSHOT_FILENAME,
     BrowserManager,
     ProfileBusyError,
-    SCREENSHOT_FILENAME,
     is_seat_limit_error,
     license_error_detail,
     test_proxy,
@@ -65,6 +73,8 @@ from .models import (
 )
 from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
+from .teach_replay_api import control_leases
+from .teach_replay_api import router as teach_replay_router
 
 logger = logging.getLogger("cloakbrowser.manager")
 
@@ -442,11 +452,13 @@ def _rewrite_pointer_event(data: bytes, offset: int) -> bytes:
     return struct.pack(">BHHHhh", 5, mask, x, y, 0, 0)
 
 
-def _filter_rfb_client_messages(data: bytes) -> bytes:
+def _filter_rfb_client_messages(data: bytes, *, input_allowed: bool = True) -> bytes:
     """Parse concatenated RFB messages, keep only standard types (0-6).
 
     Rewrites PointerEvents from 6-byte standard to 11-byte KasmVNC format
-    and strips unsupported pseudo-encodings from SetEncodings.
+    and strips unsupported pseudo-encodings from SetEncodings. When input is
+    blocked, KeyEvent, PointerEvent, and ClientCutText messages are removed
+    while view-maintenance messages continue to the server.
     """
     _log = logging.getLogger("cloakbrowser.manager")
     result = bytearray()
@@ -467,6 +479,15 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
             break
         msg_idx += 1
         if msg_type in _RFB_MSG_SIZE:
+            if not input_allowed and msg_type in (4, 5, 6):
+                _log.debug(
+                    "RFB filter: BLOCK input type=%d len=%d at offset=%d",
+                    msg_type,
+                    msg_len,
+                    offset,
+                )
+                offset += msg_len
+                continue
             # Standard RFB type — keep (with rewrites for KasmVNC compatibility)
             _log.debug("RFB filter: KEEP type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
             if msg_type == 2:  # SetEncodings — whitelist safe encodings
@@ -501,11 +522,23 @@ async def lifespan(app: FastAPI):
     if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
         browser_mgr._auto_launch_task.cancel()
         await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
-    await browser_mgr.cleanup_all()
+    try:
+        for profile_id in tuple(browser_mgr.running):
+            await _stop_running_profile(profile_id)
+        await browser_mgr.cleanup_all()
+    finally:
+        control_leases.clear()
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
+app.include_router(teach_replay_router)
+
+
+async def _stop_running_profile(profile_id: str) -> None:
+    await teach_replay_recorder.on_profile_stopped(profile_id)
+    await browser_mgr.stop(profile_id)
+    control_leases.release_profile(profile_id)
 
 
 # ── Authentication ────────────────────────────────────────────────────────────
@@ -615,7 +648,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
 async def delete_profile(profile_id: str):
     # Stop browser if running
     if profile_id in browser_mgr.running:
-        await browser_mgr.stop(profile_id)
+        await _stop_running_profile(profile_id)
 
     profile = db.get_profile(profile_id)
     if not profile:
@@ -681,7 +714,7 @@ async def reset_profile(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not found")
 
     if profile_id in browser_mgr.running:
-        await browser_mgr.stop(profile_id)
+        await _stop_running_profile(profile_id)
 
     user_data_dir = Path(profile["user_data_dir"])
     default_dir = user_data_dir / "Default"
@@ -855,7 +888,7 @@ async def launch_profile(profile_id: str):
 async def stop_profile(profile_id: str):
     if profile_id not in browser_mgr.running:
         raise HTTPException(status_code=404, detail="Profile is not running")
-    await browser_mgr.stop(profile_id)
+    await _stop_running_profile(profile_id)
     return {"ok": True}
 
 
@@ -1291,7 +1324,10 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                                 continue
 
                             # Parse RFB messages and strip unsupported types
-                            filtered = _filter_rfb_client_messages(data)
+                            filtered = _filter_rfb_client_messages(
+                                data,
+                                input_allowed=control_leases.state(profile_id) == "human",
+                            )
                             if filtered:
                                 # Safety: verify first byte is a valid RFB client type
                                 if filtered[0] not in _RFB_MSG_SIZE:
@@ -1478,7 +1514,10 @@ async def _proxy_cdp_websocket(
 ) -> None:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
-    Used by both browser-level and page-level CDP proxy endpoints.
+    Used by both browser-level and page-level CDP proxy endpoints. CDP input
+    gating is cooperative: callers must hold the exact AGENT lease and check
+    ``control_leases.agent_can_dispatch`` at the dispatch boundary. The proxy
+    remains bidirectional so observation traffic continues during handoff.
     """
     import websockets
 
