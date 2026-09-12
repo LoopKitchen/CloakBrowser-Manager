@@ -1,0 +1,263 @@
+{
+  "nodes": [
+    {
+      "id": "spike-cdp-input-loop",
+      "task": "POC0 computer-use spike on the Cloak farm (de-risk before building the executor). Standalone script, no product-code changes: read SYNAPSE_WEB_CLOAK_MANAGER_BASE_URL + SYNAPSE_WEB_CLOAK_MANAGER_AUTH_TOKEN, use the existing CloakManagerClient to find-or-create then launch a profile, connect the profile's CDP WebSocket, and run the primitive loop twice: Page.captureScreenshot -> Input.dispatchMouseEvent (move+press+release) on a button + Input.insertText into a text field on a self-contained data-URL test page that flips a DOM flag on click -> second Page.captureScreenshot -> Runtime.evaluate reads the flag. Assert: screenshots differ (hash), the click flag flipped, the typed text landed. Measure and print per-action dispatch latency and the screenshot byte size as WebP (that is the per-turn payload cost the replay loop will pay every model call). Document the env vars in the script header.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/replay/scripts/spike_cdp_input_loop.py"
+      ],
+      "depends_on": [],
+      "check": "uv run python ai_ingestion/web/replay/scripts/spike_cdp_input_loop.py exits 0 and stdout prints differing before/after screenshot hashes, the flipped click flag, and a per-action latency table",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "skill-schema",
+      "task": "The learned-skill document contract every other node reads — single-sourced here. ai_ingestion/web/skills/schema.py: SkillDoc Pydantic model — id, name, description, params[] (name, required, default, secret_ref for credential-backed params — NEVER the secret value), steps[] each carrying {action: navigate|click|type|scroll|wait|extract|assert|confirm, ordered target candidates (selector -> accessible-text/role -> coordinates-last-resort), preconditions[], postconditions[], confirm_first, consequential}, provenance {teach_session_id, recording_ref}, version, status draft->approved->deprecated. store.py: versioned on-disk CRUD under the teach data dir (draft write, approve, list, get, version diff); approve() validates that every consequential step is confirm_first and that no field matches a credential pattern (password/otp/token literals). Tests cover schema round-trip, approval rejection of creds and coords-only consequential steps, and version diffing.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/skills/__init__.py",
+        "ai_ingestion/web/skills/schema.py",
+        "ai_ingestion/web/skills/store.py",
+        "tests/web/skills/test_skill_schema.py",
+        "tests/web/skills/test_skill_store.py"
+      ],
+      "depends_on": [],
+      "check": "uv run pytest tests/web/skills/test_skill_schema.py tests/web/skills/test_skill_store.py -q green; uv run ruff check ai_ingestion/web/skills",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "cloak-client-ext",
+      "task": "Extend the existing CloakManagerClient with the control-lease + screen-recording wire surface — this file is the SINGLE SOURCE OF TRUTH for the wire contract; mgr-control-lease and mgr-screen-recorder implement against it verbatim. New methods: acquire_control(profile_id, holder: 'agent'|'human', ttl_s) -> lease dict {lease_id, state, holder, expires_at}, raising CloakLeaseConflictError on HTTP 409 (already held by another holder); release_control(profile_id, lease_id); control_status(profile_id). Recording: start_recording(profile_id); stop_recording(profile_id) -> {recording_id, duration_s, path}; recording_status(profile_id); download_recording(recording_id) -> bytes-or-URL. Typed errors CloakLeaseConflictError + CloakRecordingError; stdlib+httpx only (web/ layer rule). Unit tests fake the transport (httpx MockTransport) covering the 200 path, the 409 path, and status endpoints.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/browser/cloak/manager_client.py",
+        "tests/web/test_cloak_control_client.py"
+      ],
+      "depends_on": [],
+      "check": "uv run pytest tests/web/test_cloak_control_client.py -q green; uv run ruff check ai_ingestion/web/browser/cloak/manager_client.py",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "mgr-control-lease",
+      "task": "Exclusive per-profile control lease on the Cloak manager (AGENT/HUMAN/IDLE) — the 'Take control' moment from the reference UX (Operator/Grok/Devin patterns): the human takes over the remote screen for logins, CAPTCHAs, and irreversible moments instead of pasting credentials, then hands back. backend/control_lease.py: lease FSM — IDLE->AGENT, IDLE->HUMAN, AGENT->HUMAN (human takeover always wins, agent must yield), HUMAN->AGENT (reacquire), TTL with auto-expiry back to IDLE, release-on-profile-stop, single-flight per profile, release requires the lease_id. backend/teach_replay_api.py: a shared APIRouter the teach/replay feature mounts — this node adds POST /api/profiles/{id}/control/acquire {holder, ttl_s} -> {lease:{lease_id, state, holder, expires_at}} returning HTTP 409 when held by the other class, POST /control/release {lease_id}, GET /control/status; wire contract is single-sourced in the ai-integration manager client — mirror it verbatim. backend/main.py: include the router AND make the /api/profiles/{id}/vnc proxy lease-aware — while the holder is AGENT the filtered RFB client stream drops PointerEvent/KeyEvent/ClientCutText entirely (view frames still flow, so the operator watches but cannot touch), while HUMAN they pass; document that CDP input gating stays cooperative (the synapse executor must not dispatch while the lease is not AGENT). backend/tests/test_control_lease.py: FSM transitions incl. takeover, TTL expiry, 409 conflict, and an RFB-gating unit test proving input types are dropped while AGENT-held.",
+      "repo": "LoopKitchen/CloakBrowser-Manager",
+      "files": [
+        "backend/control_lease.py",
+        "backend/teach_replay_api.py",
+        "backend/main.py",
+        "backend/tests/test_control_lease.py"
+      ],
+      "depends_on": [],
+      "check": "python -m pytest backend/tests/test_control_lease.py -q green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "mgr-screen-recorder",
+      "task": "Per-profile screen recording of the private X display (the grok capture path). backend/recorder.py: spawn ffmpeg x11grab on the running profile's display (RunningProfile.display / ws_port display index) at 15 FPS H.264 MP4 into a recordings dir keyed by profile_id+timestamp; hard cap 600s; finalize the MP4 cleanly on stop; auto-stop when the profile stops; one active recording per profile. After stop, ffprobe-validate (reject <0.5s or corrupt) before reporting success. Recording endpoints are registered INSIDE this module by importing the shared router from teach_replay_api (POST /api/profiles/{id}/recording/start, /stop, GET /recording/status, GET /recording/{recording_id} for the MP4 download) — wire contract single-sourced in the ai-integration manager client, mirror verbatim. backend/tests/test_recorder.py: ffmpeg/ffprobe subprocess calls mocked; lifecycle, one-at-a-time enforcement, validation rejection, and endpoint tests via TestClient.",
+      "repo": "LoopKitchen/CloakBrowser-Manager",
+      "files": [
+        "backend/recorder.py",
+        "backend/tests/test_recorder.py"
+      ],
+      "depends_on": [
+        "mgr-control-lease"
+      ],
+      "check": "python -m pytest backend/tests/test_recorder.py -q green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "teach-store",
+      "task": "Teach-session domain layer. queue.py: durable signed queue — learn entries land as JSON under teach_sessions/queues/<agent-scope>/pending/<id>.json with an HMAC-SHA256 signature over the canonical JSON (key from env TEACH_QUEUE_HMAC_KEY, documented in module header); a '.prompt-delivered' marker is written after the learner is dispatched; claim uses flock with a 12h lease and lease-free claims older than 24h are treated abandoned. store.py: sqlite records for teach sessions and learning runs (session_id, profile_id/name, operator intent text, recording_ref, status, produced skill_id). service.py: start_teach(profile_name, intent) -> find_profile_by_name on the Cloak farm -> launch -> acquire the control lease holder='human' (the operator demonstrates through noVNC; agent-side input is blocked because the executor refuses to run without holding AGENT) -> start_recording -> session handle; stop_teach -> stop_recording -> release the lease -> write the signed learn entry into pending; status() surfaces recording state and produced skill. Tests fake the manager client and use tmp dirs.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/teach/__init__.py",
+        "ai_ingestion/web/teach/queue.py",
+        "ai_ingestion/web/teach/store.py",
+        "ai_ingestion/web/teach/service.py",
+        "tests/web/teach/test_teach_queue.py",
+        "tests/web/teach/test_teach_service.py"
+      ],
+      "depends_on": [
+        "skill-schema",
+        "cloak-client-ext"
+      ],
+      "check": "uv run pytest tests/web/teach -q green; uv run ruff check ai_ingestion/web/teach",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "replay-gates",
+      "task": "Run-admission and approval policy for replay. gates.py: validate_run(skill, params, idempotency_key) — bind params (all required present; secret_ref params resolve to references, never values), persist the idempotency key so a retried submission returns the original run_id instead of re-executing, and enforce declared budget caps (campaign-creating skills must carry a spend-cap param that clamps the run). Per-step gate: steps with confirm_first or consequential=true require a valid approval token before dispatch. approvals.py: signed approval tokens scoped to run_id+step_index, single-use, expiring — plus approve(run, step) / is_approved(run, step). Tests cover the validation matrix, idempotent dedup on retry, spend-cap enforcement, and an unapproved consequential step blocking dispatch.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/replay/__init__.py",
+        "ai_ingestion/web/replay/gates.py",
+        "ai_ingestion/web/replay/approvals.py",
+        "tests/web/replay/test_replay_gates.py"
+      ],
+      "depends_on": [
+        "skill-schema"
+      ],
+      "check": "uv run pytest tests/web/replay/test_replay_gates.py -q green; uv run ruff check ai_ingestion/web/replay",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "replay-evidence",
+      "task": "Run evidence bundle — the audit trail the product promise rests on. evidence.py: per-run dir containing actions.jsonl (one line per executed step: timestamp, step action, resolved target, pre/post screenshot refs, gate verdict, expected-vs-actual note), screenshots/, video_ref (manager recording_id started for the run via the extended Cloak client), skill version + params hash, and manifest.json tying it together. expected-vs-actual compares each step's postcondition text against the post-action screenshot through an injectable vision-compare function (default impl goes through the service's existing Anthropic path; tests inject a fake). Also emits the compact run-summary dict the UI renders.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/replay/evidence.py",
+        "tests/web/replay/test_evidence.py"
+      ],
+      "depends_on": [
+        "skill-schema",
+        "cloak-client-ext"
+      ],
+      "check": "uv run pytest tests/web/replay/test_evidence.py -q green; uv run ruff check ai_ingestion/web/replay/evidence.py",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "teach-learner",
+      "task": "The learn-from-demonstration pipeline (grok flow). validate.py: claim the oldest pending queue entry via flock (12h lease; lease-free claims stale >24h are abandoned and re-queued); ffprobe-validate the MP4 (reject <0.5s or corrupt); extract PNG stills at 20% and 70% as sanity frames; files >15MB split into lossless keyframe-aligned segments of ~12MB. watch.py: dispatch the recording (or its segments) to a vision-analysis call carrying the fixed watch contract verbatim — report starting state, chronological action list, ending state, per-action timing, exact non-secret typed text (credential-looking strings are NEVER transcribed — redacted as [secret]), and URLs/page-titles/UI-controls observed; plus a read-only Chrome-history slice restricted to the recording window via CDP /json/list targets on the profile (history wins for URLs, video wins for in-page actions). learner.py: merge the watch output + history slice into a SkillDoc draft under skill-schema rules — parameterize inputs, prefer stable targets over coordinates, mark consequential steps confirm_first, never embed credentials or harness mechanics (no CDP ports, no profile paths); persist the draft via the skill store linked to the teach session; the claimed video is deleted ONLY after the skill draft is persisted.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/teach/validate.py",
+        "ai_ingestion/web/teach/watch.py",
+        "ai_ingestion/web/teach/learner.py",
+        "tests/web/teach/test_teach_validate.py",
+        "tests/web/teach/test_teach_learner.py"
+      ],
+      "depends_on": [
+        "teach-store",
+        "skill-schema"
+      ],
+      "check": "uv run pytest tests/web/teach -q green (synthetic-fixture MP4 path, or an explicit skip flag when ffmpeg is absent); uv run ruff check ai_ingestion/web/teach; uv run python -m pytest tests/test_import_rules.py -x green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "replay-executor",
+      "task": "The computer-use loop that replays a SkillDoc on a live Cloak profile. cdp_input.py: CDP input driver over the profile's CDP WebSocket — dispatchMouseEvent (move/press/release + wheel scroll), dispatchKeyEvent, insertText, Page.captureScreenshot returning WebP, and a Runtime.evaluate helper. target_resolver.py: resolve a step's ordered target candidates (selector -> accessible text/role via Runtime.evaluate -> coordinates fallback) into viewport coordinates. handoff.py: HITL arbitration — pause the loop, release the AGENT lease via the extended client, emit a handoff event (reason + current screenshot ref), await the HUMAN lease release, reacquire AGENT, then force a FRESH screenshot before the next model turn. executor.py: acquire the AGENT lease -> start the run recording -> for each step: run gates (a consequential step blocks until an approval token exists), resolve the target, screenshot -> model turn (step context + accumulated action log) -> dispatch the returned action batch -> append the post-action WebP screenshot into the next model turn -> write the evidence step -> repeat until done/fail/handoff; on any terminal state release the lease and finalize the evidence bundle (video_ref from the run recording). Never logs secrets or forwards credential values to the model.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/replay/cdp_input.py",
+        "ai_ingestion/web/replay/target_resolver.py",
+        "ai_ingestion/web/replay/handoff.py",
+        "ai_ingestion/web/replay/executor.py",
+        "tests/web/replay/test_cdp_input.py",
+        "tests/web/replay/test_executor.py"
+      ],
+      "depends_on": [
+        "spike-cdp-input-loop",
+        "skill-schema",
+        "cloak-client-ext",
+        "replay-gates"
+      ],
+      "check": "uv run pytest tests/web/replay/test_executor.py tests/web/replay/test_cdp_input.py -q green (fake CDP transport + scripted model); uv run ruff check ai_ingestion/web/replay",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "agent-skill-tools",
+      "task": "Agent-facing tool surface over learned skills — this is how 'our agent' invokes a taught task. skill_tools.py follows the claude_agent_sdk @tool pattern and guard posture of browser_tools.py: list_skills(), get_skill(skill_id), run_skill(skill_id, params, idempotency_key) — launches the replay executor against the merchant's Cloak profile and streams progress/evidence refs back, request_takeover(run_id, reason) — flips control to HUMAN via the handoff path. Refuses with actionable text when no browser/cloak surface exists for the session; never accepts or forwards raw credential values — params carry secret_refs only.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/agent/tools/skill_tools.py",
+        "tests/web/test_skill_tools.py"
+      ],
+      "depends_on": [
+        "replay-executor",
+        "skill-schema"
+      ],
+      "check": "uv run pytest tests/web/test_skill_tools.py -q green; uv run ruff check ai_ingestion/web/agent/tools/skill_tools.py; uv run python -m pytest tests/test_import_rules.py -x green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "teach-replay-api",
+      "task": "The HTTP surface — this node owns ALL new route wiring. routes/teach.py: POST /api/teach/sessions {profile_name, intent} -> start_teach; POST /api/teach/sessions/{id}/stop; GET /api/teach/sessions/{id} (recording state + produced skill_id); GET /api/teach/skills (list + detail). routes/replay.py: POST /api/skills/{id}/runs {params, idempotency_key}; GET /api/runs/{id} (status, current step, live evidence refs, pending-approval step); POST /api/runs/{id}/approve {step_index}; POST /api/runs/{id}/takeover; GET /api/runs/{id}/evidence (bundle manifest). web/app.py: import both routers and include_router them — the ONLY file that mounts new routes. Thin routes only: request-model validation then delegate to the domain services; no business logic inline.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/app.py",
+        "ai_ingestion/web/routes/teach.py",
+        "ai_ingestion/web/routes/replay.py",
+        "tests/web/test_routes_teach.py",
+        "tests/web/test_routes_replay.py"
+      ],
+      "depends_on": [
+        "teach-store",
+        "teach-learner",
+        "replay-executor",
+        "replay-gates",
+        "replay-evidence"
+      ],
+      "check": "uv run pytest tests/web/test_routes_teach.py tests/web/test_routes_replay.py -q green; uv run ruff check ai_ingestion/web/routes/teach.py ai_ingestion/web/routes/replay.py ai_ingestion/web/app.py; uv run python -m pytest tests/test_import_rules.py -x green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "teach-replay-ui",
+      "task": "Operator UI in synapse-web — the experience is the Grok Bot agent-screen pattern verified from the reference media: the screen lives as a card in/next to chat, expands to a viewer, 'Teach a task' records a demonstration, a 'Take control' handoff flips control to the human (logins/CAPTCHAs/irreversible moments — they act instead of pasting credentials), and the evidence video plays back at the end. Vendor the beautifului AgentScreen element — the registry URL currently 404s so the pasted component source in the design thread is the source of truth (synapse-web/src/components/agent-screen/AgentScreen.tsx): resting card = framed capture with hover Open; expanded viewer with 'Teach a task' (REC badge + timer, collapse keeps recording running), End, and the cursor overlay. Rebuild the trimmed FauxWindow as the no-stream placeholder in Loop tokens (three traffic-light dots, fake URL bar, skeleton rows — it is the empty state before a stream connects); adapt to Tailwind 4 + React 19 with no shadcn dependency. Map it: streamSrc = the Cloak profile's live view — embed the existing CloakVncView (the /ws/cloak/<id> proxy) inside the Screen slot, or a recorded MP4 for evidence playback. Teach a task -> POST /api/teach/sessions; REC badge mirrors live recording state; Take control -> POST /api/runs/{id}/takeover flips the lease to HUMAN and back. Grok-pattern surfaces that must exist: a chat-embedded 'Learn from demonstration' pill action on a posted recording; the screen card labeled '<Agent>'s screen'; a Routines list under the screen showing learned skills with their cadence; a learned-skill card in chat rendering the SkillDoc as numbered steps plus an Inputs line plus assumption text ('I ask before checkout'); a dry-run approval card. ActionTimeline.tsx renders the run's timestamped steps (task-rows style) from GET /api/runs/{id}/evidence. ApprovalCard.tsx is the inline HITL approve gate posting /api/runs/{id}/approve. lib/teachReplayApi.ts is the typed client for the teach + replay routes. TeachReplayPane.tsx wires the pane into the session view next to BrowserPane. Vitest coverage on the API client and the approval flow.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "synapse-web/src/components/agent-screen/AgentScreen.tsx",
+        "synapse-web/src/components/agent-screen/ActionTimeline.tsx",
+        "synapse-web/src/components/agent-screen/ApprovalCard.tsx",
+        "synapse-web/src/components/agent-screen/TeachControls.tsx",
+        "synapse-web/src/components/agent-screen/AgentScreen.test.tsx",
+        "synapse-web/src/components/TeachReplayPane.tsx",
+        "synapse-web/src/lib/teachReplayApi.ts"
+      ],
+      "depends_on": [
+        "teach-replay-api"
+      ],
+      "check": "cd synapse-web && npm run lint && npm run build clean && npm run test -- agent-screen green",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "e2e-teach-replay",
+      "task": "End-to-end proof script. Run against a dev Cloak manager (CLOAK_MANAGER_BASE_URL + token envs documented in the script header): create a test profile -> teach capture — either a scripted CDP demonstration driving fixture_portal.html (a self-contained fake portal: login-ish form, a 'create campaign' button, a confirmation banner) or a canned fixture MP4 -> the learner produces a SkillDoc draft -> approve it -> a replay run executes every step through the real executor + CDP -> assert: actions.jsonl complete, before/after screenshots present, video_ref resolvable, and the fixture's confirmation DOM state reached. When no manager is reachable the same path runs against a local headed Chromium over CDP — the script prints which mode ran.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "ai_ingestion/web/replay/scripts/e2e_teach_replay.py",
+        "ai_ingestion/web/replay/scripts/fixture_portal.html"
+      ],
+      "depends_on": [
+        "teach-learner",
+        "replay-executor",
+        "agent-skill-tools",
+        "teach-replay-api",
+        "replay-evidence",
+        "mgr-screen-recorder",
+        "mgr-control-lease"
+      ],
+      "check": "uv run python ai_ingestion/web/replay/scripts/e2e_teach_replay.py exits 0 and prints PASS for teach -> learn -> replay -> evidence assertions",
+      "human_gate": false,
+      "status": "todo"
+    },
+    {
+      "id": "human-gate-campaign-demo",
+      "task": "Human gate — the real thing on a real guarded portal. The doc is the checklist the operator works through: (1) teach a campaign-create flow on a demo or sandbox merchant account (e.g. DoorDash or UberEats ads manager) through the AgentScreen UI, (2) review the learned SkillDoc — parameterized inputs, stable targets, every consequential step confirm_first, zero credentials recorded, (3) watch the replay evidence — continuous video, the actions timeline, before/after shots, the approval gate firing before the irreversible submit, (4) verify exclusivity — the agent paused while the operator held the lease and a fresh screenshot was taken after hand-back. Sign-off is recorded in the doc.",
+      "repo": "LoopKitchen/ai-integration",
+      "files": [
+        "docs/teach-replay/demo-checklist.md"
+      ],
+      "depends_on": [
+        "e2e-teach-replay",
+        "teach-replay-ui"
+      ],
+      "check": "human reviews the evidence bundle against demo-checklist.md and signs off — looks for: complete video, parameterized steps, the approval gate before the irreversible submit, exclusive agent/human control during takeover, and exact non-secret typed text captured",
+      "human_gate": true,
+      "status": "todo"
+    }
+  ]
+}
