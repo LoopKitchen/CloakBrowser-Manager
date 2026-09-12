@@ -44,6 +44,7 @@ load_env_file()
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from . import database as db
+from . import recorder as teach_replay_recorder
 from .browser_manager import (
     SCREENSHOT_FILENAME,
     BrowserManager,
@@ -535,6 +536,7 @@ app.include_router(teach_replay_router)
 
 
 async def _stop_running_profile(profile_id: str) -> None:
+    await teach_replay_recorder.on_profile_stopped(profile_id)
     await browser_mgr.stop(profile_id)
     control_leases.release_profile(profile_id)
 
