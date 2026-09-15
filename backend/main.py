@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import signal
@@ -22,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
@@ -34,6 +35,7 @@ from .env_file import load_env_file
 # (database.resolve_runtime, AUTH_TOKEN, the license config below).
 load_env_file()
 
+from . import artifacts
 from . import database as db
 from cloakbrowser.license import CloakBrowserLicenseError
 
@@ -46,6 +48,7 @@ from .browser_manager import (
     test_proxy,
 )
 from .models import (
+    ArtifactResponse,
     ClipboardRequest,
     LaunchResponse,
     LoginRequest,
@@ -488,6 +491,15 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    # Repair pass. A crash leaves bytes with no row, and the file-chooser view out of step
+    # with the database. The bookmarks file is rebuilt once at the end rather than once per
+    # profile, since each rebuild reads the whole profile list.
+    reclaimed = artifacts.reclaim_all()
+    if reclaimed:
+        logger.info("Reclaimed %d unpublished artifact file(s) left by an earlier run", reclaimed)
+    for profile_id in db.profile_ids_with_artifacts():
+        artifacts.sync_picker_view(profile_id, refresh_bookmarks=False)
+    artifacts.refresh_picker_bookmarks()
     await browser_mgr.cleanup_stale()
     # Resolve tier + pre-download the (Pro) binary before serving launches, so the
     # download never blocks a launch or auto-launch's 60s timeout.
@@ -505,6 +517,92 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
+# Multipart framing around a single file part: boundary lines, part headers, trailing CRLF.
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+
+def _declared_length(scope: Scope) -> int | None:
+    for key, value in scope.get("headers", []):
+        if key == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+async def _reject_too_large(send: Send) -> None:
+    payload = json.dumps(
+        {"detail": f"upload exceeds {artifacts.MAX_ARTIFACT_BYTES} bytes"}
+    ).encode()
+    await send({
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": payload})
+
+
+class BodyLimitMiddleware:
+    """Stop an oversized upload at the socket, before the parser spools it to disk.
+
+    The per-file cap bounds what is STORED. FastAPI finishes parsing the multipart body
+    before the endpoint runs, so on its own that cap lets a client stream unbounded bytes
+    into the temporary directory and learn about the 413 only afterwards.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        is_upload = (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path", "").endswith("/files")
+        )
+        if not is_upload:
+            await self.app(scope, receive, send)
+            return
+
+        limit = artifacts.MAX_ARTIFACT_BYTES + _MULTIPART_OVERHEAD_BYTES
+        declared = _declared_length(scope)
+        if declared is not None and declared > limit:
+            await _reject_too_large(send)
+            return
+
+        # A client may omit or understate Content-Length, so count what actually arrives.
+        state = {"received": 0, "exceeded": False}
+
+        async def limited_receive():
+            message = await receive()
+            if message.get("type") == "http.request" and not state["exceeded"]:
+                state["received"] += len(message.get("body") or b"")
+                if state["received"] > limit:
+                    state["exceeded"] = True
+                    # End the body early; the response is replaced below either way.
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        async def limited_send(message):
+            # Truncating makes the parser fail in its own terms; report the real reason.
+            if state["exceeded"]:
+                if message["type"] == "http.response.start":
+                    return
+                if message["type"] == "http.response.body":
+                    if not message.get("more_body"):
+                        await _reject_too_large(send)
+                    return
+            await send(message)
+
+        await self.app(scope, limited_receive, limited_send)
+
+
+# Added before AuthMiddleware so auth ends up OUTERMOST: an unauthenticated request is
+# refused before any of its body is read.
+app.add_middleware(BodyLimitMiddleware)
 app.add_middleware(AuthMiddleware)
 
 
@@ -608,6 +706,9 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
+    if "name" in data:
+        # The chooser sidebar labels each entry with the profile name.
+        artifacts.refresh_picker_bookmarks()
     return _profile_response(profile)
 
 
@@ -630,6 +731,8 @@ async def delete_profile(profile_id: str):
             # Then clean up disk
             if user_data_dir.exists():
                 shutil.rmtree(user_data_dir, ignore_errors=True)
+            artifacts.remove_profile_artifacts(profile_id)
+            artifacts.refresh_picker_bookmarks()
     except ProfileBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -808,6 +911,119 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
         shutil.rmtree(dst_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="Failed to duplicate profile")
     return _profile_response(clone)
+
+
+# ── Profile files ────────────────────────────────────────────────────────────
+
+
+def _artifact_response(row: dict) -> ArtifactResponse:
+    return ArtifactResponse(
+        **row,
+        container_path=str(artifacts.artifact_path(row["profile_id"], row["id"], row["name"])),
+    )
+
+
+def _require_profile(profile_id: str) -> dict:
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+
+@app.get("/api/profiles/{profile_id}/files", response_model=list[ArtifactResponse])
+async def list_profile_files(profile_id: str):
+    """Files attached to a profile — uploaded in, or downloaded by its browser."""
+    _require_profile(profile_id)
+    return [_artifact_response(row) for row in db.list_artifacts(profile_id)]
+
+
+@app.post("/api/profiles/{profile_id}/files", response_model=ArtifactResponse, status_code=201)
+async def upload_profile_file(profile_id: str, file: UploadFile = File(...)):
+    """Store an uploaded file for a profile and return its id and in-container path.
+
+    The path is what a CDP call (``DOM.setFileInputFiles``, ``Input.dispatchDragEvent``) hands
+    to the page. Uploading does not by itself select the file in any input.
+    """
+    _require_profile(profile_id)
+    artifact_id = db.new_artifact_id()
+    name = artifacts.safe_filename(file.filename)
+    try:
+        artifacts.check_quota(profile_id)
+        size = await artifacts.save_stream(profile_id, artifact_id, name, file.read)
+    except artifacts.ArtifactQuotaExceeded as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except artifacts.ArtifactTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.exception("Failed to store upload for profile %s", profile_id)
+        raise HTTPException(status_code=500, detail=f"Failed to store upload: {exc}") from exc
+
+    # Re-check against the real received size; an over-quota upload is discarded, not published.
+    try:
+        artifacts.check_quota(profile_id, size)
+    except artifacts.ArtifactQuotaExceeded as exc:
+        artifacts.delete_file(profile_id, artifact_id)
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    try:
+        row = db.create_artifact(
+            artifact_id, profile_id, name, size, kind="upload",
+            content_type=file.content_type,
+            picker_name=artifacts.reserve_picker_name(profile_id, name),
+        )
+    except Exception as exc:
+        # The bytes are on disk but nothing references them, so they could never be listed
+        # or deleted and would not count against the profile's quota.
+        artifacts.delete_file(profile_id, artifact_id)
+        logger.exception("Failed to record upload for profile %s", profile_id)
+        raise HTTPException(status_code=500, detail=f"Failed to record upload: {exc}") from exc
+    artifacts.sync_picker_view(profile_id)
+    return _artifact_response(row)
+
+
+@app.get("/api/profiles/{profile_id}/files/{artifact_id}")
+async def download_profile_file(profile_id: str, artifact_id: str):
+    """Serve an artifact's bytes.
+
+    Always an attachment of an opaque type: these files come from merchant portals, and
+    rendering one inline on the Manager's own origin would be a needless script-execution path.
+    """
+    _require_profile(profile_id)
+    row = db.get_artifact(profile_id, artifact_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if row["state"] == "pending":
+        raise HTTPException(status_code=409, detail="Download is still in progress")
+    path = artifacts.artifact_path(profile_id, artifact_id, row["name"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact bytes are missing")
+    return FileResponse(
+        path,
+        filename=row["name"],
+        media_type="application/octet-stream",
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/profiles/{profile_id}/files/{artifact_id}")
+async def delete_profile_file(profile_id: str, artifact_id: str):
+    """Remove an artifact. Row first, then bytes — same order as profile deletion, so a
+    failure leaves an unreferenced file (reclaimed with the profile) rather than a dead row."""
+    _require_profile(profile_id)
+    row = db.get_artifact(profile_id, artifact_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if row["state"] == "pending" and browser_mgr.is_active(profile_id):
+        # Removing the row would not stop the browser, and its bytes would then land with
+        # nothing to attach them to. Let the transfer reach a terminal state first.
+        raise HTTPException(
+            status_code=409, detail="Download is still in progress; it cannot be removed yet"
+        )
+    if not db.delete_artifact(profile_id, artifact_id):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifacts.delete_file(profile_id, artifact_id)
+    artifacts.sync_picker_view(profile_id)
+    return {"ok": True}
 
 
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
