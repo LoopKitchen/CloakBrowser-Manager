@@ -238,8 +238,8 @@ browser cannot see your filesystem: a file you want to upload to a website is no
 the guest's file dialog, and anything the browser downloads is trapped in the container.
 
 ```bash
-# Put a file where the profile's browser can use it
-curl -F "file=@report.csv" http://localhost:8080/api/profiles/<id>/files
+# Put a file where the profile's browser can use it: the body is the file, the header its name
+curl --data-binary @report.csv -H "X-File-Name: report.csv" http://localhost:8080/api/profiles/<id>/files
 
 # What this profile holds
 curl http://localhost:8080/api/profiles/<id>/files
@@ -250,7 +250,12 @@ curl -OJ http://localhost:8080/api/profiles/<id>/files/<artifact-id>
 curl -X DELETE http://localhost:8080/api/profiles/<id>/files/<artifact-id>
 ```
 
-An upload reports a `container_path`, which is what a CDP call that takes a path
+The upload body is the file itself, not a form: it streams straight into the profile's store,
+so a file costs one copy on disk and an oversized one is refused from its `Content-Length`
+before a byte is read. `X-File-Name` is URL-encoded (`%20` for a space), though a raw UTF-8 name
+works too; the stored type is the request's `Content-Type` when it is a real one, otherwise a
+guess from the name. An upload
+reports a `container_path`, which is what a CDP call that takes a path
 (`DOM.setFileInputFiles`, `Input.dispatchDragEvent`) hands to the page.
 
 In the Docker build the live viewer gains a files button: upload from your own machine, drop a
@@ -266,7 +271,9 @@ Download behaviour is browser-wide and last-writer-wins, so an automation client
 profile's CDP endpoint controls it: Playwright's `connect_over_cdp`, for example, sets its own
 download directory (or disables downloads entirely) as it initialises. While such a client is
 attached its downloads go where it asked, not into the profile's files — the Manager records
-nothing it cannot see, and never cancels a transfer it does not own.
+nothing it cannot see, and never cancels a transfer it does not own. When such a client
+disconnects, Chromium falls back to its default download behaviour rather than to the Manager's,
+so capture is re-armed as soon as a proxied CDP connection closes.
 
 Files live beside the profile, not inside it, so duplicating a profile's browser state never
 copies its documents. Deleting a profile deletes its files. Nothing expires on its own: the

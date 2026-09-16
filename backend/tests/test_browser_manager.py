@@ -641,3 +641,28 @@ async def test_stopping_a_browser_settles_its_pending_downloads(
     await manager.stop(running.profile_id)
 
     assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+
+
+def test_a_detaching_cdp_client_re_arms_download_capture():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    running = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    manager.running["p1"] = running
+    manager.cdp_client_detached(running)
+    assert running.download_rearm.is_set()
+    # Running without capture (native): nothing to re-arm, nothing raised.
+    native = RunningProfile("native", MagicMock(), 9223)
+    manager.running["native"] = native
+    manager.cdp_client_detached(native)
+
+
+def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    stale = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    current = RunningProfile("p1", MagicMock(), 9224, download_rearm=asyncio.Event())
+    manager.running["p1"] = current  # the profile was stopped and launched again
+    manager.cdp_client_detached(stale)
+    assert not current.download_rearm.is_set()
+    assert not stale.download_rearm.is_set()
+    manager.running.pop("p1")
+    manager.cdp_client_detached(current)  # nor a browser that is gone altogether
+    assert not current.download_rearm.is_set()

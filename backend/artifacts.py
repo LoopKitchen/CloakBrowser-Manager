@@ -14,16 +14,21 @@ import shutil
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import AsyncIterable, Callable
 
 from . import database as db
 
-# Caps are enforced as bytes arrive. Content-Length is client-supplied and proves nothing.
-MAX_ARTIFACT_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", 256 * 1024 * 1024))
-MAX_ARTIFACTS_PER_PROFILE = int(os.environ.get("ARTIFACT_MAX_COUNT", 200))
-MAX_PROFILE_ARTIFACT_BYTES = int(os.environ.get("ARTIFACT_MAX_TOTAL_BYTES", 2 * 1024 * 1024 * 1024))
 
-_CHUNK = 1024 * 1024
+def _env_int(name: str, default: int) -> int:
+    """An integer setting; unset or blank means the default (compose renders ``${X:-}`` as "")."""
+    return int(os.environ.get(name) or default)
+
+
+# Caps are enforced as bytes arrive. Content-Length is client-supplied and proves nothing.
+MAX_ARTIFACT_BYTES = _env_int("ARTIFACT_MAX_BYTES", 256 * 1024 * 1024)
+MAX_ARTIFACTS_PER_PROFILE = _env_int("ARTIFACT_MAX_COUNT", 200)
+MAX_PROFILE_ARTIFACT_BYTES = _env_int("ARTIFACT_MAX_TOTAL_BYTES", 2 * 1024 * 1024 * 1024)
+
 _INCOMING_PREFIX = ".incoming-"
 
 
@@ -154,12 +159,13 @@ def _flush_to_disk(handle) -> None:
 
 
 async def save_stream(
-    profile_id: str, artifact_id: str, name: str, read: Callable[[int], Awaitable[bytes]]
+    profile_id: str, artifact_id: str, name: str, chunks: AsyncIterable[bytes]
 ) -> int:
-    """Stream an upload to a temp file, then publish it atomically under ``artifact_id``.
+    """Stream a body to a temp file, then publish it atomically under ``artifact_id``.
 
-    The cap is enforced while receiving, and any failure removes the partial file, so a
-    half-written upload is never visible as an artifact.
+    Chunks go to disk as they arrive, so the upload costs one copy and nothing waits for the
+    whole body. The cap is enforced while receiving, and any failure removes the partial
+    file, so a half-written upload is never visible as an artifact.
     """
     directory = artifact_item_dir(profile_id, artifact_id)
     directory.mkdir(parents=True, exist_ok=True)
@@ -168,10 +174,9 @@ async def save_stream(
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
-            while True:
-                chunk = await read(_CHUNK)
+            async for chunk in chunks:
                 if not chunk:
-                    break
+                    continue
                 total += len(chunk)
                 if total > MAX_ARTIFACT_BYTES:
                     raise ArtifactTooLarge(

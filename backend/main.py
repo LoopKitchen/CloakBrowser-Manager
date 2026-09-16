@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import signal
 import struct
@@ -20,13 +21,14 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .env_file import load_env_file
@@ -517,92 +519,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
-# Multipart framing around a single file part: boundary lines, part headers, trailing CRLF.
-_MULTIPART_OVERHEAD_BYTES = 64 * 1024
-
-
-def _declared_length(scope: Scope) -> int | None:
-    for key, value in scope.get("headers", []):
-        if key == b"content-length":
-            try:
-                return int(value)
-            except ValueError:
-                return None
-    return None
-
-
-async def _reject_too_large(send: Send) -> None:
-    payload = json.dumps(
-        {"detail": f"upload exceeds {artifacts.MAX_ARTIFACT_BYTES} bytes"}
-    ).encode()
-    await send({
-        "type": "http.response.start",
-        "status": 413,
-        "headers": [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(payload)).encode()),
-        ],
-    })
-    await send({"type": "http.response.body", "body": payload})
-
-
-class BodyLimitMiddleware:
-    """Stop an oversized upload at the socket, before the parser spools it to disk.
-
-    The per-file cap bounds what is STORED. FastAPI finishes parsing the multipart body
-    before the endpoint runs, so on its own that cap lets a client stream unbounded bytes
-    into the temporary directory and learn about the 413 only afterwards.
-    """
-
-    def __init__(self, app: ASGIApp):
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        is_upload = (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path", "").endswith("/files")
-        )
-        if not is_upload:
-            await self.app(scope, receive, send)
-            return
-
-        limit = artifacts.MAX_ARTIFACT_BYTES + _MULTIPART_OVERHEAD_BYTES
-        declared = _declared_length(scope)
-        if declared is not None and declared > limit:
-            await _reject_too_large(send)
-            return
-
-        # A client may omit or understate Content-Length, so count what actually arrives.
-        state = {"received": 0, "exceeded": False}
-
-        async def limited_receive():
-            message = await receive()
-            if message.get("type") == "http.request" and not state["exceeded"]:
-                state["received"] += len(message.get("body") or b"")
-                if state["received"] > limit:
-                    state["exceeded"] = True
-                    # End the body early; the response is replaced below either way.
-                    return {"type": "http.request", "body": b"", "more_body": False}
-            return message
-
-        async def limited_send(message):
-            # Truncating makes the parser fail in its own terms; report the real reason.
-            if state["exceeded"]:
-                if message["type"] == "http.response.start":
-                    return
-                if message["type"] == "http.response.body":
-                    if not message.get("more_body"):
-                        await _reject_too_large(send)
-                    return
-            await send(message)
-
-        await self.app(scope, limited_receive, limited_send)
-
-
-# Added before AuthMiddleware so auth ends up OUTERMOST: an unauthenticated request is
-# refused before any of its body is read.
-app.add_middleware(BodyLimitMiddleware)
 app.add_middleware(AuthMiddleware)
 
 
@@ -937,23 +853,66 @@ async def list_profile_files(profile_id: str):
     return [_artifact_response(row) for row in db.list_artifacts(profile_id)]
 
 
-@app.post("/api/profiles/{profile_id}/files", response_model=ArtifactResponse, status_code=201)
-async def upload_profile_file(profile_id: str, file: UploadFile = File(...)):
-    """Store an uploaded file for a profile and return its id and in-container path.
+def _content_length(request: Request) -> int | None:
+    try:
+        return int(request.headers["content-length"])
+    except (KeyError, ValueError):
+        return None
 
-    The path is what a CDP call (``DOM.setFileInputFiles``, ``Input.dispatchDragEvent``) hands
-    to the page. Uploading does not by itself select the file in any input.
+
+# Body types a client sends by default rather than because they are true of the file:
+# curl's --data-binary is form-urlencoded, browsers fall back to octet-stream.
+_GENERIC_BODY_TYPES = {"application/octet-stream", "application/x-www-form-urlencoded"}
+
+
+def _upload_content_type(request: Request, name: str) -> str | None:
+    declared = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if declared and declared not in _GENERIC_BODY_TYPES:
+        return declared
+    return mimetypes.guess_type(name)[0] or declared or None
+
+
+@app.post("/api/profiles/{profile_id}/files", response_model=ArtifactResponse, status_code=201)
+async def upload_profile_file(profile_id: str, request: Request):
+    """Store the request body as a file of the profile; returns its id and in-container path.
+
+    The body is the file itself, streamed straight into the profile's store: one copy on
+    disk, nothing buffered ahead of the size check. ``X-File-Name`` carries the name,
+    URL-encoded. The path returned is what a CDP call (``DOM.setFileInputFiles``,
+    ``Input.dispatchDragEvent``) hands to the page; uploading does not by itself select the
+    file in any input.
     """
     _require_profile(profile_id)
+    encoded_name = request.headers.get("x-file-name")
+    if encoded_name is None:
+        raise HTTPException(
+            status_code=400, detail="X-File-Name header (the URL-encoded file name) is required"
+        )
+    # Starlette decodes header bytes as latin-1; undoing that first accepts both the
+    # frontend's percent-encoded name and a raw UTF-8 one typed into curl.
+    name = artifacts.safe_filename(
+        unquote_to_bytes(encoded_name.encode("latin-1")).decode("utf-8", "replace")
+    )
+    stop_sending = {"Connection": "close"}  # a refusal before the body is read must end it
+    declared = _content_length(request)
+    if declared is not None and declared > artifacts.MAX_ARTIFACT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload exceeds {artifacts.MAX_ARTIFACT_BYTES} bytes",
+            headers=stop_sending,
+        )
     artifact_id = db.new_artifact_id()
-    name = artifacts.safe_filename(file.filename)
     try:
-        artifacts.check_quota(profile_id)
-        size = await artifacts.save_stream(profile_id, artifact_id, name, file.read)
+        # What the client declared is refused up front; what it actually sends is re-checked.
+        artifacts.check_quota(profile_id, declared or 0)
     except artifacts.ArtifactQuotaExceeded as exc:
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
+        raise HTTPException(status_code=507, detail=str(exc), headers=stop_sending) from exc
+    try:
+        size = await artifacts.save_stream(profile_id, artifact_id, name, request.stream())
     except artifacts.ArtifactTooLarge as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+        raise HTTPException(status_code=413, detail=str(exc), headers=stop_sending) from exc
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=400, detail="client disconnected during upload") from exc
     except OSError as exc:
         logger.exception("Failed to store upload for profile %s", profile_id)
         raise HTTPException(status_code=500, detail=f"Failed to store upload: {exc}") from exc
@@ -968,7 +927,7 @@ async def upload_profile_file(profile_id: str, file: UploadFile = File(...)):
     try:
         row = db.create_artifact(
             artifact_id, profile_id, name, size, kind="upload",
-            content_type=file.content_type,
+            content_type=_upload_content_type(request, name),
             picker_name=artifacts.reserve_picker_name(profile_id, name),
         )
     except Exception as exc:
@@ -1689,15 +1648,39 @@ async def cdp_json_list(profile_id: str, request: Request):
     return data
 
 
+_DOWNLOAD_BEHAVIOUR_METHODS = ("Browser.setDownloadBehavior", "Page.setDownloadBehavior")
+
+
+def _sets_download_behaviour(frame: str) -> bool:
+    """Whether a client->CDP frame changes the profile's download behaviour.
+
+    A call naming a ``browserContextId`` targets a context the client created itself, not
+    the profile's own (default) context, so it is not one Chromium will undo on our behalf.
+    """
+    if "setDownloadBehavior" not in frame:  # cheap check first: this runs per frame
+        return False
+    try:
+        message = json.loads(frame)
+        return (
+            message.get("method") in _DOWNLOAD_BEHAVIOUR_METHODS
+            and not (message.get("params") or {}).get("browserContextId")
+        )
+    except (ValueError, AttributeError):
+        return False
+
+
 async def _proxy_cdp_websocket(
     websocket: WebSocket, target_url: str, label: str,
-) -> None:
+) -> bool:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
-    Used by both browser-level and page-level CDP proxy endpoints.
+    Used by both browser-level and page-level CDP proxy endpoints. Returns whether the
+    client changed the browser's download behaviour: Chromium reverts that to its default
+    when such a client detaches, so the caller then has capture re-armed.
     """
     import websockets
 
+    touched_downloads = False
     try:
         async with websockets.connect(
             target_url, max_size=None, ping_interval=None, ping_timeout=None
@@ -1705,12 +1688,15 @@ async def _proxy_cdp_websocket(
             logger.info("%s: connected to %s", label, target_url)
 
             async def client_to_cdp():
+                nonlocal touched_downloads
                 try:
                     while True:
                         msg = await websocket.receive()
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"]:
+                            if not touched_downloads and _sets_download_behaviour(msg["text"]):
+                                touched_downloads = True
                             await cdp_ws.send(msg["text"])
                         elif "bytes" in msg and msg["bytes"]:
                             await cdp_ws.send(msg["bytes"])
@@ -1747,6 +1733,7 @@ async def _proxy_cdp_websocket(
             await websocket.close()
         except Exception as exc:
             logger.debug("%s: websocket.close() failed: %s", label, exc)
+    return touched_downloads
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp")
@@ -1774,7 +1761,10 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
+    if await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]"):
+        # Only once the upstream socket is closed: Chromium has processed the detach by
+        # then, and capture is reasserted after it.
+        browser_mgr.cdp_client_detached(running)
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
@@ -1791,7 +1781,8 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     await websocket.accept()
 
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
+    if await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]"):
+        browser_mgr.cdp_client_detached(running)
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────

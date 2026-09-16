@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import httpx
 
@@ -198,47 +198,159 @@ def handle_event(tracker: DownloadTracker, message: dict) -> None:
 _RECONNECT_DELAYS = (1, 2, 5, 10, 30)
 
 
-async def _capture_session(profile_id: str, cdp_port: int, staging: Path) -> None:
+class _Session:
+    """Id-matched calls over one browser-level CDP socket; every other message is an event.
+
+    A reply is recognised by its id, never by arrival order: events interleave with replies.
+    """
+
+    def __init__(self, ws: Any, profile_id: str) -> None:
+        self._ws = ws
+        self.profile_id = profile_id
+        self.on_event: Callable[[dict], None] = lambda message: None
+        self._next_id = 0
+        self._replies: dict[int, asyncio.Future] = {}
+
+    async def call(self, method: str, params: dict | None = None, *, timeout: float = 10) -> dict:
+        self._next_id += 1
+        call_id = self._next_id
+        reply: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._replies[call_id] = reply
+        try:
+            await self._ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+            message = await asyncio.wait_for(reply, timeout)
+        finally:
+            self._replies.pop(call_id, None)
+        if "error" in message:
+            raise RuntimeError(f"{method} refused: {message['error']}")
+        return message.get("result") or {}
+
+    async def pump(self) -> None:
+        """Deliver replies to their callers and events to ``on_event`` until the socket closes."""
+        try:
+            async for raw in self._ws:
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                call_id = message.get("id")
+                reply = self._replies.get(call_id) if isinstance(call_id, int) else None
+                if reply is not None:
+                    if not reply.done():
+                        reply.set_result(message)
+                    continue
+                try:
+                    self.on_event(message)
+                except Exception as exc:  # one bad event must not end capture
+                    logger.warning("Profile %s: download event failed: %s", self.profile_id, exc)
+        finally:
+            for reply in self._replies.values():
+                if not reply.done():
+                    reply.set_exception(ConnectionError("CDP socket closed"))
+
+
+async def _arm(session: _Session, staging: Path) -> None:
+    await session.call("Browser.setDownloadBehavior", {
+        "behavior": "allowAndName", "downloadPath": str(staging), "eventsEnabled": True,
+    })
+
+
+def _cancel_via(session: _Session, profile_id: str) -> Callable[[str], None]:
+    """A tracker callback that asks Chromium to stop a transfer, reporting a refusal."""
+    in_flight: set[asyncio.Future] = set()  # the loop only holds tasks weakly
+
+    def cancel(guid: str) -> None:
+        task = asyncio.ensure_future(session.call("Browser.cancelDownload", {"guid": guid}))
+        in_flight.add(task)
+
+        def report(done: asyncio.Future) -> None:
+            in_flight.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.warning(
+                    "Profile %s: could not cancel download %s: %s", profile_id, guid, done.exception()
+                )
+
+        task.add_done_callback(report)
+
+    return cancel
+
+
+async def _rearm_on_detach(
+    session: _Session, staging: Path, rearm: asyncio.Event, profile_id: str
+) -> None:
+    """Chromium drops download behaviour back to its default when a client that set its own
+    detaches — not back to ours — so a Playwright session leaving would switch capture off."""
+    while True:
+        await rearm.wait()
+        rearm.clear()
+        await _arm(session, staging)
+        logger.debug("Profile %s: download capture re-armed after a CDP client detached", profile_id)
+
+
+async def _run_capture(
+    session: _Session,
+    staging: Path,
+    rearm: asyncio.Event | None,
+    profile_id: str,
+    on_armed: Callable[[], None] | None = None,
+) -> None:
+    """Arm capture and keep it armed until the socket closes. Raises if it drops."""
+    pump = asyncio.ensure_future(session.pump())
+    tasks = [pump]
+    try:
+        # Only claim capture is on once Chromium has actually accepted the configuration.
+        await _arm(session, staging)
+        logger.info("Download capture armed for profile %s", profile_id)
+        if on_armed is not None:
+            on_armed()
+        if rearm is not None:
+            tasks.append(asyncio.ensure_future(_rearm_on_detach(session, staging, rearm, profile_id)))
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # The socket has the last word: a clean close returns even if it cut a re-arm short.
+        if pump.done():
+            pump.result()
+            return
+        for task in tasks[1:]:
+            if task.done():
+                task.result()  # a refused re-arm propagates to the reconnect loop
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _capture_session(
+    profile_id: str,
+    cdp_port: int,
+    staging: Path,
+    rearm: asyncio.Event | None = None,
+    on_armed: Callable[[], None] | None = None,
+) -> None:
     """One CDP connection's worth of capture. Returns when the socket closes cleanly."""
     import websockets
 
     url = await _browser_websocket_url(cdp_port)
     async with websockets.connect(url, max_size=None, ping_interval=None) as ws:
-        def cancel(guid: str) -> None:
-            asyncio.ensure_future(ws.send(json.dumps({
-                "id": 0, "method": "Browser.cancelDownload", "params": {"guid": guid},
-            })))
-
-        tracker = DownloadTracker(profile_id, cancel=cancel)
-        await ws.send(json.dumps({
-            "id": 1,
-            "method": "Browser.setDownloadBehavior",
-            "params": {
-                "behavior": "allowAndName",
-                "downloadPath": str(staging),
-                "eventsEnabled": True,
-            },
-        }))
-        # Only claim capture is on once Chromium has actually accepted the configuration.
-        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-        if ack.get("id") == 1 and "error" in ack:
-            raise RuntimeError(f"setDownloadBehavior refused: {ack['error']}")
-        logger.info("Download capture armed for profile %s", profile_id)
-        async for raw in ws:
-            try:
-                handle_event(tracker, json.loads(raw))
-            except Exception as exc:  # one bad event must not end capture
-                logger.warning("Profile %s: download event failed: %s", profile_id, exc)
+        session = _Session(ws, profile_id)
+        tracker = DownloadTracker(profile_id, cancel=_cancel_via(session, profile_id))
+        session.on_event = lambda message: handle_event(tracker, message)
+        await _run_capture(session, staging, rearm, profile_id, on_armed)
 
 
 async def watch(
-    profile_id: str, cdp_port: int, still_running: Callable[[], bool] | None = None
+    profile_id: str,
+    cdp_port: int,
+    still_running: Callable[[], bool] | None = None,
+    rearm: asyncio.Event | None = None,
 ) -> None:
     """Arm download capture on a running profile and publish what it downloads.
 
     Never raises into the launch path: losing capture must not cost the browser. A dropped
     socket is retried while the browser is still running, because otherwise capture would
-    stay off silently until the next launch.
+    stay off silently until the next launch. ``rearm`` is set whenever an external CDP client
+    disconnects, since it may have taken the browser's download behaviour with it.
     """
     try:
         staging = staging_dir(profile_id)
@@ -249,19 +361,28 @@ async def watch(
         if stranded:
             logger.info("Profile %s: failed %d download(s) interrupted by a restart", profile_id, stranded)
 
-        for delay in (0, *_RECONNECT_DELAYS):
-            if delay:
-                await asyncio.sleep(delay)
+        budget: list[int] = []
+
+        def armed() -> None:
+            # A session that armed earns a fresh budget: a long-lived browser must not end
+            # up without capture because of a few drops spread over days.
+            budget[:] = list(_RECONNECT_DELAYS)
+
+        armed()
+        while True:
             if still_running is not None and not still_running():
                 return
             try:
-                await _capture_session(profile_id, cdp_port, staging)
+                await _capture_session(profile_id, cdp_port, staging, rearm, on_armed=armed)
                 return  # closed cleanly — the browser is going away
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("Profile %s: download capture dropped: %s", profile_id, exc)
-        logger.warning("Profile %s: download capture gave up reconnecting", profile_id)
+            if not budget:
+                logger.warning("Profile %s: download capture gave up reconnecting", profile_id)
+                return
+            await asyncio.sleep(budget.pop(0))
     except asyncio.CancelledError:
         raise
     except Exception as exc:

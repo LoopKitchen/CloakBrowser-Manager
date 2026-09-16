@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -332,3 +335,192 @@ def test_a_pending_download_can_be_cleared_once_the_browser_is_gone(
 
     assert app_client.delete(f"/api/profiles/{pid}/files/{artifact_id}").status_code == 200
     assert db.get_artifact(pid, artifact_id) is None
+
+
+# ── CDP session plumbing ──────────────────────────────────────────────────────
+
+
+_CLOSED = object()
+
+
+class FakeSocket:
+    """Just enough of a websockets connection: sends are recorded, receives are scripted."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self._incoming: asyncio.Queue = asyncio.Queue()
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    def feed(self, message: object) -> None:
+        """Queue a message (any JSON value) for the reader."""
+        self._incoming.put_nowait(json.dumps(message))
+
+    def close(self) -> None:
+        self._incoming.put_nowait(_CLOSED)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        raw = await self._incoming.get()
+        if raw is _CLOSED:
+            raise StopAsyncIteration
+        return raw
+
+
+async def _until(condition, tries: int = 200) -> None:
+    for _ in range(tries):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+@pytest.mark.asyncio
+async def test_a_reply_is_matched_by_id_not_by_arrival_order(profile: dict):
+    ws = FakeSocket()
+    session = downloads._Session(ws, profile["id"])
+    events: list[dict] = []
+    session.on_event = events.append
+    pump = asyncio.ensure_future(session.pump())
+    call = asyncio.ensure_future(session.call("Browser.setDownloadBehavior", {"behavior": "allowAndName"}))
+    await _until(lambda: ws.sent)
+    # An event squeezes in ahead of the reply; it must not be mistaken for the ack.
+    ws.feed({"method": "Browser.downloadWillBegin", "params": {"guid": "g1"}})
+    ws.feed({"id": ws.sent[0]["id"], "result": {"ok": True}})
+    assert await call == {"ok": True}
+    assert events == [{"method": "Browser.downloadWillBegin", "params": {"guid": "g1"}}]
+    ws.close()
+    await pump
+
+
+@pytest.mark.asyncio
+async def test_a_refused_call_raises(profile: dict):
+    ws = FakeSocket()
+    session = downloads._Session(ws, profile["id"])
+    pump = asyncio.ensure_future(session.pump())
+    call = asyncio.ensure_future(session.call("Browser.setDownloadBehavior"))
+    await _until(lambda: ws.sent)
+    ws.feed({"id": ws.sent[0]["id"], "error": {"code": -32000, "message": "nope"}})
+    with pytest.raises(RuntimeError, match="nope"):
+        await call
+    ws.close()
+    await pump
+
+
+@pytest.mark.asyncio
+async def test_a_call_fails_fast_when_the_socket_closes(profile: dict):
+    ws = FakeSocket()
+    session = downloads._Session(ws, profile["id"])
+    pump = asyncio.ensure_future(session.pump())
+    call = asyncio.ensure_future(session.call("Browser.setDownloadBehavior"))
+    await _until(lambda: ws.sent)
+    ws.close()
+    await pump
+    with pytest.raises(ConnectionError):
+        await call
+
+
+@pytest.mark.asyncio
+async def test_capture_is_re_armed_when_a_cdp_client_detaches(profile: dict, tmp_path: Path):
+    ws = FakeSocket()
+    rearm = asyncio.Event()
+    session = downloads._Session(ws, profile["id"])
+    run = asyncio.ensure_future(downloads._run_capture(session, tmp_path, rearm, profile["id"]))
+    await _until(lambda: len(ws.sent) == 1)
+    ws.feed({"id": ws.sent[0]["id"], "result": {}})  # Chromium accepts the initial arm
+    rearm.set()  # the proxy saw an external client disconnect
+    await _until(lambda: len(ws.sent) == 2)
+    assert ws.sent[1]["method"] == "Browser.setDownloadBehavior"
+    assert ws.sent[1]["params"] == {
+        "behavior": "allowAndName", "downloadPath": str(tmp_path), "eventsEnabled": True,
+    }
+    assert not rearm.is_set()
+    ws.feed({"id": ws.sent[1]["id"], "result": {}})
+    ws.close()  # the browser goes away
+    await run  # a clean close returns without raising
+
+
+@pytest.mark.asyncio
+async def test_a_refused_re_arm_drops_the_session_so_it_reconnects(profile: dict, tmp_path: Path):
+    ws = FakeSocket()
+    rearm = asyncio.Event()
+    session = downloads._Session(ws, profile["id"])
+    run = asyncio.ensure_future(downloads._run_capture(session, tmp_path, rearm, profile["id"]))
+    await _until(lambda: len(ws.sent) == 1)
+    ws.feed({"id": ws.sent[0]["id"], "result": {}})
+    rearm.set()
+    await _until(lambda: len(ws.sent) == 2)
+    ws.feed({"id": ws.sent[1]["id"], "error": {"code": -32000, "message": "not now"}})
+    with pytest.raises(RuntimeError, match="not now"):
+        await run
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_the_browser_refuses_is_reported(profile: dict, caplog):
+    class Refusing:
+        async def call(self, method: str, params: dict | None = None) -> dict:
+            raise RuntimeError("Browser.cancelDownload refused: no such download")
+
+    cancel = downloads._cancel_via(Refusing(), profile["id"])
+    with caplog.at_level(logging.WARNING, logger="cloakbrowser.manager.downloads"):
+        cancel("guid-9")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    assert "could not cancel download guid-9" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_messages_do_not_end_capture(profile: dict):
+    ws = FakeSocket()
+    session = downloads._Session(ws, profile["id"])
+    events: list[dict] = []
+    session.on_event = events.append
+    pump = asyncio.ensure_future(session.pump())
+    call = asyncio.ensure_future(session.call("Browser.setDownloadBehavior"))
+    await _until(lambda: ws.sent)
+    for junk in ([], None, "text", 7, {"id": [1]}, {"id": "x", "method": "Browser.downloadProgress"}):
+        ws.feed(junk)
+    ws.feed({"id": ws.sent[0]["id"], "result": {}})
+    assert await call == {}  # the reply still found its caller
+    # Only objects reach the handler, which ignores what it does not recognise.
+    assert events == [{"id": [1]}, {"id": "x", "method": "Browser.downloadProgress"}]
+    ws.close()
+    await pump
+
+
+@pytest.mark.asyncio
+async def test_a_clean_close_during_a_re_arm_is_not_reported_as_a_drop(profile: dict, tmp_path: Path):
+    ws = FakeSocket()
+    rearm = asyncio.Event()
+    session = downloads._Session(ws, profile["id"])
+    run = asyncio.ensure_future(downloads._run_capture(session, tmp_path, rearm, profile["id"]))
+    await _until(lambda: len(ws.sent) == 1)
+    ws.feed({"id": ws.sent[0]["id"], "result": {}})
+    rearm.set()
+    await _until(lambda: len(ws.sent) == 2)
+    ws.close()  # the browser goes away before answering the re-arm
+    assert await run is None  # a clean close, not a ConnectionError
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_armed_earns_a_fresh_reconnect_budget(profile: dict, monkeypatch):
+    monkeypatch.setattr(downloads, "_RECONNECT_DELAYS", (0, 0))
+    attempts: list[int] = []
+
+    async def session(profile_id, cdp_port, staging, rearm=None, on_armed=None):
+        attempts.append(len(attempts) + 1)
+        n = attempts[-1]
+        if n == 3:
+            on_armed()  # armed fine, dropped later
+            raise ConnectionError("dropped")
+        if n in (1, 2, 4):
+            raise ConnectionError("refused")
+        # n == 5: closed cleanly
+
+    monkeypatch.setattr(downloads, "_capture_session", session)
+    await downloads.watch(profile["id"], 9222)
+    # Without the reset, the two-slot budget would have been spent by attempt 3.
+    assert attempts == [1, 2, 3, 4, 5]

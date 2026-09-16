@@ -245,10 +245,16 @@ export const api = {
     request<ProfileFile[]>(`/api/profiles/${id}/files`),
 
   uploadProfileFile: async (id: string, file: File): Promise<ProfileFile> => {
-    const form = new FormData();
-    form.append("file", file);
-    // No Content-Type header on purpose: the browser must set the multipart boundary.
-    const res = await fetch(`/api/profiles/${id}/files`, { method: "POST", body: form });
+    // The file is the body itself, streamed as-is. Its name travels in a header, URL-encoded,
+    // because header values cannot carry arbitrary Unicode.
+    const res = await fetch(`/api/profiles/${id}/files`, {
+      method: "POST",
+      body: file,
+      headers: {
+        "X-File-Name": encodeURIComponent(file.name),
+        "Content-Type": file.type || "application/octet-stream",
+      },
+    });
     if (!res.ok) {
       if (res.status === 401 && _onUnauthorized) {
         _onUnauthorized();

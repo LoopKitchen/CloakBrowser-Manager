@@ -100,19 +100,26 @@ describe("api.duplicateProfile", () => {
 // ── profile files ───────────────────────────────────────────────────────────
 
 describe("api profile files", () => {
-  it("uploads as multipart WITHOUT a Content-Type header", async () => {
-    const stored = { id: "a1", name: "report.csv", size: 3 };
+  it("uploads the file itself as the body, with its name URL-encoded in a header", async () => {
+    const stored = { id: "a1", name: "Q3 report (final).csv", size: 3 };
     mockFetch.mockResolvedValueOnce(jsonResponse(stored));
-    const file = new File([new Uint8Array([1, 2, 3])], "report.csv", { type: "text/csv" });
+    const file = new File([new Uint8Array([1, 2, 3])], "Q3 report (final).csv", { type: "text/csv" });
 
     expect(await api.uploadProfileFile("p1", file)).toEqual(stored);
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("/api/profiles/p1/files");
     expect(init.method).toBe("POST");
-    expect(init.body).toBeInstanceOf(FormData);
-    expect((init.body as FormData).get("file")).toBe(file);
-    // The browser must choose the multipart boundary itself.
-    expect(init.headers).toBeUndefined();
+    expect(init.body).toBe(file); // streamed as-is, never wrapped in a form
+    expect(init.headers).toEqual({
+      "X-File-Name": "Q3%20report%20(final).csv",
+      "Content-Type": "text/csv",
+    });
+  });
+
+  it("falls back to octet-stream when the browser does not know the file's type", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "a2", name: "blob.zzz", size: 0 }));
+    await api.uploadProfileFile("p1", new File([], "blob.zzz"));
+    expect(mockFetch.mock.calls[0][1].headers["Content-Type"]).toBe("application/octet-stream");
   });
 
   it("surfaces the server's reason when an upload is refused", async () => {
