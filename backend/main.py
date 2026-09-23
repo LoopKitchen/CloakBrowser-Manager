@@ -68,6 +68,7 @@ from .models import (
     TagResponse,
     UpdateCheckResponse,
 )
+from .rfb_stream import ServerStreamTranslator, build_server_cut_text, parse_kasmvnc_clipboard
 from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
 
@@ -302,43 +303,9 @@ FRONTEND_DIR = bundle_dir() / "frontend" / "dist"
 # ---------------------------------------------------------------------------
 
 
-def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
-    """Extract text/plain from KasmVNC BinaryClipboard (type 180).
-
-    Format: type(1) + action(1) + flags(4) + entries...
-    Each entry: mime_len(u8) + mime(N) + data_len(u32 BE) + data(M)
-    """
-    if len(data) < 7:
-        return None
-    offset = 6  # skip type(1) + action(1) + flags(4)
-    while offset < len(data):
-        if offset + 1 > len(data):
-            break
-        mime_len = data[offset]
-        offset += 1
-        if offset + mime_len > len(data):
-            break
-        mime_type = data[offset:offset + mime_len]
-        offset += mime_len
-        if offset + 4 > len(data):
-            break
-        data_len = struct.unpack_from(">I", data, offset)[0]
-        offset += 4
-        if mime_type == b"text/plain":
-            end = min(offset + data_len, len(data))
-            return data[offset:end].decode("utf-8", errors="replace")
-        offset += data_len
-    return None
-
-
-def _build_server_cut_text(text: str) -> bytes:
-    """Build standard RFB ServerCutText (type 3) message.
-
-    RFB spec mandates Latin-1 encoding for ServerCutText.
-    Characters outside Latin-1 (CJK, emoji, etc.) are replaced with '?'.
-    """
-    text_bytes = text.encode("latin-1", errors="replace")
-    return struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
+# Parsing lives in rfb_stream so the stream walker and this module share one format.
+_parse_kasmvnc_clipboard = parse_kasmvnc_clipboard
+_build_server_cut_text = build_server_cut_text
 
 
 # ---------------------------------------------------------------------------
@@ -356,13 +323,13 @@ _RFB_MSG_SIZE: dict[int, int | None] = {
     4: 8,     # KeyEvent
     5: 6,     # PointerEvent
     6: None,  # ClientCutText — 8 + length
+    150: 10,  # EnableContinuousUpdates — KasmVNC grants it once Fence is negotiated
+    248: None,  # ClientFence — 9 + payload length (noVNC's fence reply)
 }
 
 # Extension types that noVNC sends — known sizes so we can skip past them
 # instead of breaking and dropping all trailing data in the frame.
 _RFB_EXTENSION_SIZE: dict[int, int] = {
-    150: 10,  # EnableContinuousUpdates (1+1+2+2+2+2)
-    248: 10,  # QEMU-like key event (observed from noVNC 1.4.0)
     252: 4,   # xvp (1+1+1+1)
     255: 4,   # QEMU audio control (1+1+2) — noVNC QEMUExtendedKeyEvent is actually 12
 }
@@ -382,6 +349,8 @@ _ALLOWED_ENCODINGS: set[int] = {
     # Safe pseudo-encodings
     -239,  # Cursor (0xFFFFFF11) — cursor shape
     -224,  # LastRect (0xFFFFFF20) — performance optimization
+    -312,  # Fence — KasmVNC only allows continuous updates for fence-capable clients
+    -313,  # ContinuousUpdates — frames are pushed instead of one per request
     # Tight quality/compress levels (these are just hints)
     *range(-32, -22),   # quality levels 0-9
     *range(-256, -246),  # compress levels 0-9
@@ -400,6 +369,8 @@ def _rfb_msg_length(data: bytes, offset: int) -> int | None:
     if msg_type == 2 and remaining >= 4:  # SetEncodings
         num_enc = struct.unpack_from(">H", data, offset + 2)[0]
         return 4 + num_enc * 4
+    if msg_type == 248 and remaining >= 9:  # ClientFence
+        return 9 + data[offset + 8]
     if msg_type == 6 and remaining >= 8:  # ClientCutText
         length = struct.unpack_from(">I", data, offset + 4)[0]
         return 8 + length
@@ -447,11 +418,14 @@ def _rewrite_pointer_event(data: bytes, offset: int) -> bytes:
     return struct.pack(">BHHHhh", 5, mask, x, y, 0, 0)
 
 
-def _filter_rfb_client_messages(data: bytes) -> bytes:
-    """Parse concatenated RFB messages, keep only standard types (0-6).
+def _filter_rfb_client_messages(data: bytes, on_pixel_format=None) -> bytes:
+    """Parse concatenated RFB messages, keep only whitelisted types.
 
-    Rewrites PointerEvents from 6-byte standard to 11-byte KasmVNC format
-    and strips unsupported pseudo-encodings from SetEncodings.
+    Keeps the standard types (0-6) plus EnableContinuousUpdates (150) and
+    ClientFence (248). Rewrites PointerEvents from 6-byte standard to 11-byte
+    KasmVNC format and strips unsupported pseudo-encodings from SetEncodings.
+    ``on_pixel_format`` receives the 16-byte pixel format of each SetPixelFormat,
+    which the server-stream translator needs to size screen data.
     """
     _log = logging.getLogger("cloakbrowser.manager")
     result = bytearray()
@@ -474,6 +448,8 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
         if msg_type in _RFB_MSG_SIZE:
             # Standard RFB type — keep (with rewrites for KasmVNC compatibility)
             _log.debug("RFB filter: KEEP type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
+            if msg_type == 0 and on_pixel_format is not None:  # SetPixelFormat
+                on_pixel_format(data[offset + 4:offset + 20])
             if msg_type == 2:  # SetEncodings — whitelist safe encodings
                 result.extend(_rewrite_set_encodings(data, offset, msg_len))
             elif msg_type == 5:  # PointerEvent — expand to KasmVNC's 11-byte format
@@ -1433,15 +1409,18 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                 profile_id, vnc_ws.subprotocol,
             )
 
-            # noVNC v1.4 sends extension message types (150=ContinuousUpdates,
-            # 248=QEMUKey, etc.) that KasmVNC 1.3.3 doesn't support, causing
-            # "unknown message type" → disconnect.
+            # noVNC sends extension message types KasmVNC 1.3.3 rejects with a
+            # disconnect; only whitelisted types and encodings are forwarded.
+            # EnableContinuousUpdates (150) and ClientFence (248) are allowed:
+            # KasmVNC supports both once the Fence pseudo-encoding is negotiated.
             #
             # noVNC batches multiple RFB messages into a single WebSocket frame,
             # so we must parse the RFB stream to find message boundaries and strip
             # unsupported types before forwarding. Standard client→server types
             # have known fixed sizes (except SetEncodings and ClientCutText which
             # encode their length).
+
+            translator = ServerStreamTranslator(label=f"[v->c {profile_id[:8]}]")
 
             async def client_to_vnc():
                 count = 0
@@ -1466,7 +1445,7 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                                 continue
 
                             # Parse RFB messages and strip unsupported types
-                            filtered = _filter_rfb_client_messages(data)
+                            filtered = _filter_rfb_client_messages(data, translator.set_pixel_format)
                             if filtered:
                                 # Safety: verify first byte is a valid RFB client type
                                 if filtered[0] not in _RFB_MSG_SIZE:
@@ -1497,24 +1476,16 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                 try:
                     async for msg in vnc_ws:
                         count += 1
-                        if isinstance(msg, bytes) and len(msg) > 0:
-                            msg_type = msg[0]
-                            if msg_type == 180:
-                                # KasmVNC BinaryClipboard → convert to standard
-                                # ServerCutText (type 3) so noVNC can handle it
-                                text = _parse_kasmvnc_clipboard(msg)
-                                if text:
-                                    logger.info("VNC proxy [v->c]: clipboard %d chars", len(text))
-                                    await websocket.send_bytes(_build_server_cut_text(text))
-                                else:
-                                    logger.info("VNC proxy [v->c]: dropped type 180 (no text/plain)")
-                                continue
-                            await websocket.send_bytes(msg)
-                        elif isinstance(msg, bytes):
-                            await websocket.send_bytes(msg)
+                        if isinstance(msg, bytes):
+                            # KasmVNC's BinaryClipboard (180) can sit anywhere in a frame,
+                            # so the translator walks the stream to convert it in place.
+                            out = translator.feed(msg)
+                            if out:
+                                await websocket.send_bytes(out)
                         else:
                             await websocket.send_text(msg)
-                    logger.info("VNC proxy [v->c]: KasmVNC stream ended after %d msgs (close_code=%s)", count, vnc_ws.close_code)
+                    logger.info("VNC proxy [v->c]: KasmVNC stream ended after %d msgs (close_code=%s, clipboards=%d, passthrough=%s)",
+                                count, vnc_ws.close_code, translator.clipboards, translator.passthrough)
                 except WebSocketDisconnect as exc:
                     logger.info("VNC proxy [v->c]: client disconnect code=%s after %d msgs", exc.code, count)
                 except Exception as exc:
