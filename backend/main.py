@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import unquote_to_bytes, urlparse
+from urllib.parse import parse_qsl, unquote_to_bytes, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -70,6 +70,7 @@ from .models import (
 )
 from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
+from .control_api import control_leases, router as control_router, verify_vnc_token
 
 logger = logging.getLogger("cloakbrowser.manager")
 
@@ -136,6 +137,29 @@ RELEASE_CHANNEL: str | None = _resolve_setting(
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/health"})
+
+
+def _check_vnc_ws_auth(scope: Scope) -> bool:
+    """Per-run VNC token on the /vnc websocket path: an alternative to the
+    master bearer for browser clients. The token is bound to a live human
+    control lease, so a released or expired lease closes the door."""
+    if not AUTH_TOKEN:
+        return False
+    parts = scope["path"].split("/")
+    if (
+        len(parts) != 5
+        or parts[1] != "api"
+        or parts[2] != "profiles"
+        or parts[4] != "vnc"
+    ):
+        return False
+    profile_id = parts[3]
+    query = dict(parse_qsl(scope.get("query_string", b"").decode("latin-1")))
+    lease_id = verify_vnc_token(AUTH_TOKEN, query.get("vnc_token", ""), profile_id)
+    if lease_id is None:
+        return False
+    lease = control_leases.status(profile_id)
+    return bool(lease and lease.holder == "human" and lease.lease_id == lease_id)
 
 
 def _check_auth(scope: Scope) -> bool:
@@ -272,6 +296,10 @@ class AuthMiddleware:
 
         # Skip auth for exempt endpoints and non-API paths (static frontend)
         if path in _AUTH_EXEMPT or not path.startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+
+        if scope["type"] == "websocket" and _check_vnc_ws_auth(scope):
             await self.app(scope, receive, send)
             return
 
@@ -447,11 +475,13 @@ def _rewrite_pointer_event(data: bytes, offset: int) -> bytes:
     return struct.pack(">BHHHhh", 5, mask, x, y, 0, 0)
 
 
-def _filter_rfb_client_messages(data: bytes) -> bytes:
+def _filter_rfb_client_messages(data: bytes, *, input_allowed: bool = True) -> bytes:
     """Parse concatenated RFB messages, keep only standard types (0-6).
 
     Rewrites PointerEvents from 6-byte standard to 11-byte KasmVNC format
-    and strips unsupported pseudo-encodings from SetEncodings.
+    and strips unsupported pseudo-encodings from SetEncodings. When input is
+    blocked, KeyEvent, PointerEvent, and ClientCutText are removed while
+    view-maintenance messages continue to the server.
     """
     _log = logging.getLogger("cloakbrowser.manager")
     result = bytearray()
@@ -472,6 +502,10 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
             break
         msg_idx += 1
         if msg_type in _RFB_MSG_SIZE:
+            if not input_allowed and msg_type in (4, 5, 6):
+                _log.debug("RFB filter: BLOCK input type=%d len=%d", msg_type, msg_len)
+                offset += msg_len
+                continue
             # Standard RFB type — keep (with rewrites for KasmVNC compatibility)
             _log.debug("RFB filter: KEEP type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
             if msg_type == 2:  # SetEncodings — whitelist safe encodings
@@ -516,10 +550,12 @@ async def lifespan(app: FastAPI):
         browser_mgr._auto_launch_task.cancel()
         await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
     await browser_mgr.cleanup_all()
+    control_leases.clear()
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
+app.include_router(control_router)
 
 
 # ── Authentication ────────────────────────────────────────────────────────────
@@ -633,6 +669,7 @@ async def delete_profile(profile_id: str):
     # Stop browser if running
     if profile_id in browser_mgr.running:
         await browser_mgr.stop(profile_id)
+        control_leases.release_profile(profile_id)
 
     profile = db.get_profile(profile_id)
     if not profile:
@@ -701,6 +738,7 @@ async def reset_profile(profile_id: str):
 
     if profile_id in browser_mgr.running:
         await browser_mgr.stop(profile_id)
+        control_leases.release_profile(profile_id)
 
     user_data_dir = Path(profile["user_data_dir"])
     default_dir = user_data_dir / "Default"
@@ -1031,6 +1069,7 @@ async def stop_profile(profile_id: str):
     if profile_id not in browser_mgr.running:
         raise HTTPException(status_code=404, detail="Profile is not running")
     await browser_mgr.stop(profile_id)
+    control_leases.release_profile(profile_id)
     return {"ok": True}
 
 
@@ -1465,8 +1504,12 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                                 await vnc_ws.send(data)
                                 continue
 
-                            # Parse RFB messages and strip unsupported types
-                            filtered = _filter_rfb_client_messages(data)
+                            # Parse RFB messages, strip unsupported types and
+                            # drop input while the profile is not human-controlled
+                            filtered = _filter_rfb_client_messages(
+                                data,
+                                input_allowed=control_leases.state(profile_id) == "human",
+                            )
                             if filtered:
                                 # Safety: verify first byte is a valid RFB client type
                                 if filtered[0] not in _RFB_MSG_SIZE:
