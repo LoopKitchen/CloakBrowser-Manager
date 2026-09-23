@@ -34,7 +34,7 @@ def parse_kasmvnc_clipboard(data: bytes) -> Optional[str]:
 
     Wire format (SMsgWriter::writeBinaryClipboard, unchanged from KasmVNC 1.0.0 to 1.5):
     type(1) count(1), then per entry: id(4) mime_len(1) mime data_len(4) data.
-    A truncated message returns None rather than a partial text.
+    A truncated message, or text above MAX_CLIPBOARD_TEXT, returns None.
     """
     if len(data) < 2 or data[0] != _BINARY_CLIPBOARD:
         return None
@@ -53,6 +53,8 @@ def parse_kasmvnc_clipboard(data: bytes) -> Optional[str]:
         if off + data_len > len(data):
             return None
         if mime.split(b";", 1)[0].strip() == b"text/plain":
+            if data_len > MAX_CLIPBOARD_TEXT:  # same limit as the streaming path, checked before decoding
+                return None
             return bytes(data[off:off + data_len]).decode("utf-8", errors="replace")
         off += data_len
     return None

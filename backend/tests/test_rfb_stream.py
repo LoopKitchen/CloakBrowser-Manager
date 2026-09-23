@@ -263,6 +263,16 @@ def test_first_text_entry_wins_and_later_entries_are_discarded():
     assert t.feed(clip + b"\x02") == build_server_cut_text("first") + b"\x02"
 
 
+def test_passthrough_applies_the_same_clipboard_text_limit(monkeypatch):
+    monkeypatch.setattr(rfb_stream, "MAX_CLIPBOARD_TEXT", 8)
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    t.feed(bytes([77]))  # unknown message: passthrough from here
+    assert t.passthrough
+    assert t.feed(_clipboard(("text/plain", b"0123456789"))) == b""
+    assert t.feed(_clipboard(("text/plain", b"short"))) == build_server_cut_text("short")
+
+
 def test_unit_that_never_completes_falls_back(monkeypatch):
     monkeypatch.setattr(rfb_stream, "MAX_HELD_MESSAGE", 5)
     t = ServerStreamTranslator()
