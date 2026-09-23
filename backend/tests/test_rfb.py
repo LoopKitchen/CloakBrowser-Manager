@@ -97,6 +97,11 @@ def test_parse_clipboard_multiple_mimes():
     assert _parse_kasmvnc_clipboard(data) == "world"
 
 
+def test_parse_clipboard_truncated_text_is_rejected():
+    data = _make_kasmvnc_clipboard(("text/plain", b"complete text"))
+    assert _parse_kasmvnc_clipboard(data[:-3]) is None
+
+
 def test_parse_clipboard_utf8():
     data = _make_kasmvnc_clipboard(("text/plain", "café".encode()))
     assert _parse_kasmvnc_clipboard(data) == "café"

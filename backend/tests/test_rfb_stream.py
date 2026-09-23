@@ -232,13 +232,63 @@ def test_non_none_security_falls_back_to_passthrough():
     assert t.passthrough
 
 
-def test_oversized_held_message_falls_back(monkeypatch):
-    monkeypatch.setattr(rfb_stream, "MAX_HELD_MESSAGE", 100)
+def test_oversized_clipboard_text_is_discarded_not_forwarded(monkeypatch):
+    """Type 180 must never reach noVNC, however large the clipboard."""
+    monkeypatch.setattr(rfb_stream, "MAX_CLIPBOARD_TEXT", 100)
     t = ServerStreamTranslator()
     t.feed(_handshake())
-    partial = _clipboard(("text/plain", b"y" * 1000))[:500]
+    data = _clipboard(("text/plain", b"x" * 1000)) + b"\x02"
+    out = b"".join(t.feed(data[i:i + 64]) for i in range(0, len(data), 64))
+    assert out == b"\x02"
+    assert not t.passthrough
+    assert t.clipboards == 0
+
+
+def test_non_text_clipboard_entries_are_streamed_not_buffered():
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    clip = _clipboard(("image/png", b"\x89" * 100_000), ("text/plain", b"after image"))
+    out, peak = bytearray(), 0
+    for i in range(0, len(clip), 4096):
+        out += t.feed(clip[i:i + 4096])
+        peak = max(peak, len(t._buf))
+    assert bytes(out) == build_server_cut_text("after image")
+    assert peak <= 4096
+
+
+def test_first_text_entry_wins_and_later_entries_are_discarded():
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    clip = _clipboard(("text/plain", b"first"), ("text/plain", b"second"), ("text/html", b"<i>x</i>"))
+    assert t.feed(clip + b"\x02") == build_server_cut_text("first") + b"\x02"
+
+
+def test_unit_that_never_completes_falls_back(monkeypatch):
+    monkeypatch.setattr(rfb_stream, "MAX_HELD_MESSAGE", 5)
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    partial = _fbu(_rect(0, 0, 1, 1, 0, b"\x00" * 4))[:12]  # update header + 8 of 12 rect-header bytes
     assert t.feed(partial) == partial
     assert t.passthrough
+
+
+def test_unaligned_888_format_uses_full_width_tight_pixels():
+    """KasmVNC's is888() also requires byte-aligned shifts; otherwise Tight sends 4 bytes."""
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    t.set_pixel_format(_pf(rs=17, gs=9, bs=1))
+    stream = _fbu(_rect(0, 0, 64, 64, 7, b"\x80" + b"\x10" * 4)) + _clipboard(("text/plain", b"ok"))
+    assert t.feed(stream).endswith(build_server_cut_text("ok"))
+    assert not t.passthrough
+
+
+def test_aligned_888_format_with_other_shifts_uses_three_byte_pixels():
+    t = ServerStreamTranslator()
+    t.feed(_handshake())
+    t.set_pixel_format(_pf(rs=0, gs=8, bs=16))  # BGR order, still byte aligned
+    stream = _fbu(_rect(0, 0, 64, 64, 7, b"\x80" + b"\x10" * 3)) + _clipboard(("text/plain", b"ok"))
+    assert t.feed(stream).endswith(build_server_cut_text("ok"))
+    assert not t.passthrough
 
 
 @pytest.mark.parametrize("n", [0, 1, 0x7F, 0x80, 0x3FFF, 0x4000, 0x3FFFFF])

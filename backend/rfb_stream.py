@@ -20,7 +20,10 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("cloakbrowser.manager")
 
-# Largest single message held back for conversion (a clipboard carrying an image).
+# Largest clipboard text translated for the viewer. Larger text, and every non-text
+# entry, is discarded by its declared length without being buffered.
+MAX_CLIPBOARD_TEXT = 8 * 1024 * 1024
+# Safety net for any other unit that never completes; far above any real header.
 MAX_HELD_MESSAGE = 32 * 1024 * 1024
 
 _BINARY_CLIPBOARD = 180
@@ -29,8 +32,9 @@ _BINARY_CLIPBOARD = 180
 def parse_kasmvnc_clipboard(data: bytes) -> Optional[str]:
     """Return the text/plain entry of a KasmVNC BinaryClipboard message, or None.
 
-    Wire format (KasmVNC 1.3 SMsgWriter::writeBinaryClipboard):
+    Wire format (SMsgWriter::writeBinaryClipboard, unchanged from KasmVNC 1.0.0 to 1.5):
     type(1) count(1), then per entry: id(4) mime_len(1) mime data_len(4) data.
+    A truncated message returns None rather than a partial text.
     """
     if len(data) < 2 or data[0] != _BINARY_CLIPBOARD:
         return None
@@ -46,6 +50,8 @@ def parse_kasmvnc_clipboard(data: bytes) -> Optional[str]:
         off += mime_len
         data_len = struct.unpack_from(">I", data, off)[0]
         off += 4
+        if off + data_len > len(data):
+            return None
         if mime.split(b";", 1)[0].strip() == b"text/plain":
             return bytes(data[off:off + data_len]).decode("utf-8", errors="replace")
         off += data_len
@@ -125,7 +131,12 @@ class ServerStreamTranslator:
         self.passthrough = False
         self.clipboards = 0
         self._buf = bytearray()
-        self._skip = 0
+        self._skip = 0  # payload bytes to forward untouched
+        self._drop = 0  # payload bytes to discard (non-text clipboard entries)
+        self._clip_left = 0
+        self._clip_found = False
+        self._clip_len = 0
+        self._clip_after: Callable[[_Reader], _Unit] = self._message
         self._state: Callable[[_Reader], _Unit] = self._version
         self._rects_left: Optional[int] = 0  # None: until LastRect
         self._hextile: Optional[list[int]] = None  # [x, y, w, h, next_tx, next_ty]
@@ -136,9 +147,13 @@ class ServerStreamTranslator:
 
     def set_pixel_format(self, pf: bytes) -> None:
         """Apply a 16-byte RFB PIXEL_FORMAT (ServerInit or the client's SetPixelFormat)."""
-        bpp, depth, _big, true_colour, rmax, gmax, bmax = struct.unpack_from(">BBBBHHH", pf, 0)
+        bpp, depth, _big, true_colour, rmax, gmax, bmax, rs, gs, bs = struct.unpack_from(">BBBBHHHBBB", pf, 0)
         self._bpp = max(1, bpp // 8)
-        is888 = bpp == 32 and depth == 24 and true_colour and rmax == gmax == bmax == 255
+        # Mirrors KasmVNC's PixelFormat::is888(): only then does Tight send 3-byte pixels.
+        is888 = (
+            bpp == 32 and depth == 24 and true_colour and rmax == gmax == bmax == 255
+            and not (rs & 7 or gs & 7 or bs & 7)
+        )
         self._tpixel = 3 if is888 else self._bpp
 
     def feed(self, data: bytes) -> bytes:
@@ -154,13 +169,20 @@ class ServerStreamTranslator:
             self.passthrough = True
             out += self._buf
             self._buf.clear()
-            self._skip = 0
+            self._skip = self._drop = 0
         return bytes(out)
 
     # -- engine ---------------------------------------------------------------
 
     def _run(self, out: bytearray) -> None:
         while True:
+            if self._drop:
+                n = min(self._drop, len(self._buf))
+                if not n:
+                    return
+                del self._buf[:n]
+                self._drop -= n
+                continue
             if self._skip:
                 n = min(self._skip, len(self._buf))
                 if not n:
@@ -252,12 +274,14 @@ class ServerStreamTranslator:
         if t == 178:  # Stats
             r.skip(3)
             return 8, None, r.u32()
-        if t == _BINARY_CLIPBOARD:
-            for _ in range(r.u8()):
-                r.skip(4)
-                r.skip(r.u8())
-                r.skip(r.u32())
-            return r.pos, self._convert_clipboard(bytes(r.buf[:r.pos])), 0
+        if t == _BINARY_CLIPBOARD:  # never forwarded: noVNC disconnects on type 180
+            count = r.u8()
+            if count:
+                self._clip_left, self._clip_found = count, False
+                self._state = self._clip_entry
+            else:
+                logger.info("VNC proxy %s: dropped BinaryClipboard without text", self.label)
+            return 2, b"", 0
         if t == 182:  # SubscribeUnixRelay
             r.skip(1)
             r.skip(r.u8())
@@ -271,6 +295,40 @@ class ServerStreamTranslator:
             r.skip(r.u8())
             return r.pos, None, 0
         raise _Desync(f"server message type {t}")
+
+    def _clip_entry(self, r: _Reader) -> _Unit:
+        """One BinaryClipboard entry header: id(4) mime_len(1) mime data_len(4)."""
+        r.skip(4)
+        mime_len = r.u8()
+        r.skip(mime_len)
+        mime = bytes(r.buf[5:5 + mime_len])
+        data_len = r.u32()
+        self._clip_left -= 1
+        after = self._clip_entry if self._clip_left else self._message
+        is_text = mime.split(b";", 1)[0].strip() == b"text/plain"
+        if is_text and not self._clip_found and data_len <= MAX_CLIPBOARD_TEXT:
+            self._clip_len = data_len
+            self._clip_after = after
+            self._state = self._clip_text
+        else:
+            if is_text and not self._clip_found:
+                logger.info("VNC proxy %s: dropped %d-byte clipboard text (limit %d)", self.label, data_len, MAX_CLIPBOARD_TEXT)
+            self._drop = data_len
+            self._state = after
+            if not self._clip_left and not self._clip_found:
+                logger.info("VNC proxy %s: dropped BinaryClipboard without text", self.label)
+        return r.pos, b"", 0
+
+    def _clip_text(self, r: _Reader) -> _Unit:
+        r.skip(self._clip_len)
+        text = bytes(r.buf[:self._clip_len]).decode("utf-8", errors="replace")
+        self._clip_found = True
+        self._state = self._clip_after
+        if not text:  # never clear the viewer's clipboard
+            return r.pos, b"", 0
+        self.clipboards += 1
+        logger.info("VNC proxy %s: clipboard %d chars", self.label, len(text))
+        return r.pos, build_server_cut_text(text), 0
 
     def _after_rect(self) -> None:
         if self._rects_left is not None:
