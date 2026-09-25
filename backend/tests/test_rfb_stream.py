@@ -161,7 +161,7 @@ def test_byte_by_byte():
 
 
 def test_clipboard_packed_inside_a_frame_is_converted():
-    """The production failure: screen data and a clipboard announcement in one frame."""
+    """The observed failure: screen data and a clipboard announcement in one frame."""
     t = ServerStreamTranslator()
     t.feed(_handshake())
     frame = _fbu(_rect(0, 0, 64, 64, 7, b"\x90" + _compact(4) + b"jpeg")) + _clipboard(("text/plain", b"stress-07"))
