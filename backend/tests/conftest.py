@@ -52,8 +52,34 @@ def _append_webrtc_exit_ip(args, exit_ip):
 
 
 _mock_browser._append_webrtc_exit_ip = _append_webrtc_exit_ip  # type: ignore[attr-defined]
-# Real rule: replace `--fingerprint-webrtc-ip=auto` with the proxy exit IP, or drop it. Tests patch it.
-_mock_browser._resolve_webrtc_args = lambda args, proxy: args  # type: ignore[attr-defined]
+# Faithful copy of cloakbrowser.browser._resolve_webrtc_args (0.5.6-0.5.11): only the FIRST
+# `--fingerprint-webrtc-ip=auto` is handled; it becomes the proxy exit IP, or is removed when there
+# is no proxy or the lookup fails. The lookup is recorded with the thread it ran on, so tests can
+# assert it never runs on the event loop's thread. Set `webrtc_exit_ip` to None to simulate failure.
+_mock_browser.webrtc_lookups = []  # type: ignore[attr-defined]
+_mock_browser.webrtc_exit_ip = "198.51.100.4"  # type: ignore[attr-defined]
+
+
+def _resolve_webrtc_args(args, proxy):
+    import threading
+
+    if not args or "--fingerprint-webrtc-ip=auto" not in args:
+        return args
+    idx = args.index("--fingerprint-webrtc-ip=auto")
+    args = list(args)
+    if not proxy:
+        del args[idx]
+        return args
+    _mock_browser.webrtc_lookups.append((proxy, threading.get_ident()))
+    exit_ip = _mock_browser.webrtc_exit_ip
+    if exit_ip:
+        args[idx] = f"--fingerprint-webrtc-ip={exit_ip}"
+    else:
+        del args[idx]
+    return args
+
+
+_mock_browser._resolve_webrtc_args = _resolve_webrtc_args  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
 sys.modules.setdefault("cloakbrowser.browser", _mock_browser)

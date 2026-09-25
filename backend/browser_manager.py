@@ -107,9 +107,15 @@ async def _resolve_webrtc_auto(args: list[str], proxy: str | None, exit_ip: str 
     """
     if _WEBRTC_AUTO not in args:
         return args
+    # Keep only the first `auto`: the library's resolver handles one, and any left over would be
+    # resolved by the launcher on the event loop.
+    first = args.index(_WEBRTC_AUTO)
+    args = [a for i, a in enumerate(args) if a != _WEBRTC_AUTO or i == first]
     if exit_ip and proxy:
-        return [f"--fingerprint-webrtc-ip={exit_ip}" if a == _WEBRTC_AUTO else a for a in args]
-    return await asyncio.to_thread(_resolve_webrtc_args, args, proxy) or []
+        args = [f"--fingerprint-webrtc-ip={exit_ip}" if a == _WEBRTC_AUTO else a for a in args]
+    else:
+        args = await asyncio.to_thread(_resolve_webrtc_args, args, proxy) or []
+    return [a for a in args if a != _WEBRTC_AUTO]  # the launcher must never receive `auto`
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:

@@ -692,7 +692,7 @@ async def _heartbeat():
 
     async def beat():
         while True:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
             ticks[0] += 1
 
     task = asyncio.create_task(beat())
@@ -761,7 +761,7 @@ async def test_a_slow_lookup_does_not_freeze_the_event_loop(monkeypatch, tmp_pat
     manager, _ = _geo_manager(monkeypatch, slow_resolve, launch=AsyncMock(side_effect=blocking_library_launch))
     async with _heartbeat() as ticks:
         await manager.launch(_geoip_profile(tmp_path))
-    assert ticks[0] >= 6  # ~12 expected over 0.6s; a blocked loop gets ~0
+    assert ticks[0] >= 6  # ~30 expected over 0.6s at 20ms; a blocked loop gets ~0
 
 
 @pytest.mark.asyncio
@@ -883,7 +883,7 @@ async def test_webrtc_auto_without_geoip_is_resolved_off_the_loop(monkeypatch, t
     resolve.assert_not_called()
     assert len(seen) == 1 and seen[0][0] == "http://user:pass@proxy.example:33335"
     assert seen[0][1] != threading.get_ident()
-    assert ticks[0] >= 6
+    assert ticks[0] >= 6  # ~30 expected at 20ms; a blocked loop gets ~0
     args = launch.await_args.kwargs["args"]
     assert _AUTO not in args and "--fingerprint-webrtc-ip=198.51.100.4" in args
 
@@ -914,3 +914,66 @@ async def test_webrtc_auto_without_a_proxy_defers_to_the_library_rule(monkeypatc
     # With no proxy the machine's own IP is what sites see; the library just removes `auto`.
     rule.assert_called_once()
     assert _AUTO not in launch.await_args.kwargs["args"]
+
+
+# The duplicate-flag tests below use conftest's FAITHFUL resolver (not a monkeypatch): the library
+# handles only the first `auto`, and the fake launcher resolves any `auto` it is handed exactly as
+# the real launcher does, on the event loop. Every lookup records its thread.
+
+
+@pytest.fixture
+def webrtc_resolver():
+    import cloakbrowser.browser as stub
+
+    stub.webrtc_lookups.clear()
+    stub.webrtc_exit_ip = "198.51.100.4"
+    yield stub
+    stub.webrtc_lookups.clear()
+    stub.webrtc_exit_ip = "198.51.100.4"
+
+
+def _launcher_that_resolves_auto_on_the_loop(stub):
+    async def launch(**kwargs):
+        # The real launcher calls the resolver synchronously, i.e. on the event loop's thread.
+        kwargs["args"] = stub._resolve_webrtc_args(kwargs["args"], kwargs.get("proxy"))
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    return AsyncMock(side_effect=launch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("geoip", [False, True])
+async def test_repeated_auto_flags_never_reach_the_launcher(monkeypatch, tmp_path: Path, webrtc_resolver, geoip):
+    import threading
+
+    launch = _launcher_that_resolves_auto_on_the_loop(webrtc_resolver)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO), launch=launch)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=geoip, launch_args=[_AUTO, "--x", _AUTO])
+    await manager.launch(profile)
+
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args
+    webrtc = [a for a in args if a.startswith("--fingerprint-webrtc-ip")]
+    assert len(webrtc) == 1  # one flag, whichever branch resolved it
+    assert webrtc == ["--fingerprint-webrtc-ip=" + ("203.0.113.7" if geoip else "198.51.100.4")]
+    loop_thread = threading.get_ident()
+    assert all(thread != loop_thread for _proxy, thread in webrtc_resolver.webrtc_lookups)
+    assert len(webrtc_resolver.webrtc_lookups) == (0 if geoip else 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_with_repeated_auto_flags_drops_all_of_them(monkeypatch, tmp_path: Path, webrtc_resolver):
+    import threading
+
+    webrtc_resolver.webrtc_exit_ip = None  # the lookup fails: the library drops the flag
+    launch = _launcher_that_resolves_auto_on_the_loop(webrtc_resolver)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO), launch=launch)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO, _AUTO])
+    await manager.launch(profile)
+
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in launch.await_args.kwargs["args"])
+    assert [t != threading.get_ident() for _p, t in webrtc_resolver.webrtc_lookups] == [True]
