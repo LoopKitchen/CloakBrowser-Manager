@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
+from cloakbrowser.browser import _append_webrtc_exit_ip, maybe_resolve_geoip
 from cloakbrowser.license import (
     CloakBrowserLicenseError,
     license_error_for_code,
@@ -508,16 +509,27 @@ class BrowserManager:
             if proxy:
                 _validate_proxy(proxy)
 
+            timezone = profile.get("timezone") or None
+            locale = profile.get("locale") or None
+            if profile.get("geoip", False):
+                # cloakbrowser's async launcher resolves GeoIP with a blocking call ON this event
+                # loop, once per CDP attempt, freezing /api/health for up to 20s each. Resolve it
+                # once here in a thread and pass the result; the library then does no lookup.
+                timezone, locale, exit_ip = await asyncio.to_thread(
+                    maybe_resolve_geoip, True, proxy, timezone, locale, extra_args
+                )
+                extra_args = _append_webrtc_exit_ip(extra_args, exit_ip) or extra_args
+
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
                 "headless": False,
                 "proxy": proxy,
                 "args": extra_args,
-                "timezone": profile.get("timezone") or None,
-                "locale": profile.get("locale") or None,
+                "timezone": timezone,
+                "locale": locale,
                 "humanize": bool(profile.get("humanize", False)),
                 "human_preset": profile.get("human_preset", "default"),
-                "geoip": bool(profile.get("geoip", False)),
+                "geoip": False,  # resolved above when the profile asks for it
                 "color_scheme": profile.get("color_scheme") or None,
                 "extension_paths": profile.get("extension_paths") or [],
                 "license_key": self.license_key,

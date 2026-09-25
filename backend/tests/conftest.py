@@ -39,7 +39,22 @@ _mock_license.CloakBrowserLicenseError = type(  # type: ignore[attr-defined]
 _mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-defined]
 _mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
 
+_mock_browser = types.ModuleType("cloakbrowser.browser")
+_mock_browser.maybe_resolve_geoip = MagicMock(return_value=(None, None, None))  # type: ignore[attr-defined]
+
+
+def _append_webrtc_exit_ip(args, exit_ip):
+    """Same rule as cloakbrowser.browser._append_webrtc_exit_ip (0.5.10/0.5.11)."""
+    if exit_ip and not (args and any(a.startswith("--fingerprint-webrtc-ip") for a in args)):
+        args = list(args or [])
+        args.append(f"--fingerprint-webrtc-ip={exit_ip}")
+    return args
+
+
+_mock_browser._append_webrtc_exit_ip = _append_webrtc_exit_ip  # type: ignore[attr-defined]
+
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
+sys.modules.setdefault("cloakbrowser.browser", _mock_browser)
 sys.modules.setdefault("cloakbrowser.config", _mock_config)
 sys.modules.setdefault("cloakbrowser.download", _mock_download)
 sys.modules.setdefault("cloakbrowser.license", _mock_license)

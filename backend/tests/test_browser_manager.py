@@ -666,3 +666,149 @@ def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
     manager.running.pop("p1")
     manager.cdp_client_detached(current)  # nor a browser that is gone altogether
     assert not current.download_rearm.is_set()
+
+
+# ── GeoIP resolved off the event loop ────────────────────────────────────────
+# cloakbrowser's async launcher resolves GeoIP with a blocking call on the event
+# loop (maybe_resolve_geoip, 20s timeout), once per CDP attempt. The Manager now
+# resolves it once, in a thread, and launches with geoip=False plus the result.
+
+_GEO = ("America/New_York", "en-US", "203.0.113.7")
+
+
+def _geoip_profile(tmp_path: Path) -> dict:
+    profile = _launch_profile(tmp_path)
+    profile["geoip"] = True
+    profile["proxy"] = "http://user:pass@proxy.example:33335"
+    return profile
+
+
+def _geo_manager(monkeypatch, resolve, launch=None, wait_for_cdp=None):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    launch = launch or AsyncMock(return_value=context)
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = wait_for_cdp or AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+    monkeypatch.setattr(module, "maybe_resolve_geoip", resolve)
+    return manager, launch
+
+
+@pytest.mark.asyncio
+async def test_geoip_is_resolved_off_the_loop_and_the_library_skips_it(monkeypatch, tmp_path: Path):
+    import threading
+
+    calls = []
+
+    def resolve(geoip, proxy, timezone, locale, args):
+        calls.append((geoip, proxy, timezone, locale, threading.get_ident()))
+        return _GEO
+
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    await manager.launch(_geoip_profile(tmp_path))
+
+    assert len(calls) == 1
+    geoip, proxy, timezone, locale, thread_id = calls[0]
+    assert geoip is True and proxy == "http://user:pass@proxy.example:33335"
+    assert (timezone, locale) == (None, None)
+    assert thread_id != threading.get_ident()  # not on the event loop's thread
+    options = launch.await_args.kwargs
+    assert options["geoip"] is False
+    assert (options["timezone"], options["locale"]) == ("America/New_York", "en-US")
+    assert "--fingerprint-webrtc-ip=203.0.113.7" in options["args"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_lookup_does_not_freeze_the_event_loop(monkeypatch, tmp_path: Path):
+    """The shard-killing symptom: /api/health (any coroutine) must keep running while GeoIP resolves."""
+    import time
+
+    def slow_resolve(*_args):
+        time.sleep(0.6)
+        return _GEO
+
+    async def blocking_library_launch(**kwargs):
+        # The real library blocks the loop when asked to resolve GeoIP itself.
+        if kwargs.get("geoip"):
+            time.sleep(0.6)
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    manager, _ = _geo_manager(monkeypatch, slow_resolve, launch=AsyncMock(side_effect=blocking_library_launch))
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.05)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    await manager.launch(_geoip_profile(tmp_path))
+    beat.cancel()
+    assert ticks >= 6  # ~12 expected over 0.6s; a blocked loop gets ~0
+
+
+@pytest.mark.asyncio
+async def test_the_lookup_runs_once_across_cdp_retries(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    contexts = [MagicMock(pages=[], close=AsyncMock()), MagicMock(pages=[], close=AsyncMock())]
+    contexts[1].add_init_script = AsyncMock()
+    manager, launch = _geo_manager(
+        monkeypatch,
+        resolve,
+        launch=AsyncMock(side_effect=contexts),
+        wait_for_cdp=AsyncMock(side_effect=[TimeoutError("busy"), None]),
+    )
+    await manager.launch(_geoip_profile(tmp_path))
+    assert launch.await_count == 2
+    resolve.assert_called_once()
+    assert all(call.kwargs["geoip"] is False for call in launch.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_explicit_timezone_and_locale_reach_the_lookup(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=("Europe/Berlin", "de-DE", "203.0.113.7"))
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile.update(timezone="Europe/Berlin", locale="de-DE")
+    await manager.launch(profile)
+    assert resolve.call_args.args[2:4] == ("Europe/Berlin", "de-DE")
+    assert launch.await_args.kwargs["timezone"] == "Europe/Berlin"
+
+
+@pytest.mark.asyncio
+async def test_a_user_webrtc_flag_is_not_overridden(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile["launch_args"] = ["--fingerprint-webrtc-ip=198.51.100.9"]
+    await manager.launch(profile)
+    webrtc = [a for a in launch.await_args.kwargs["args"] if a.startswith("--fingerprint-webrtc-ip")]
+    assert webrtc == ["--fingerprint-webrtc-ip=198.51.100.9"]
+
+
+@pytest.mark.asyncio
+async def test_geoip_off_does_no_lookup(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, timezone="America/Chicago", locale="en-US")
+    await manager.launch(profile)
+    resolve.assert_not_called()
+    options = launch.await_args.kwargs
+    assert options["geoip"] is False and options["timezone"] == "America/Chicago"
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in options["args"])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_fails_the_launch_cleanly(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(side_effect=RuntimeError("GeoIP resolution timed out after 20.0s"))
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    with pytest.raises(RuntimeError, match="GeoIP resolution timed out"):
+        await manager.launch(_geoip_profile(tmp_path))
+    launch.assert_not_awaited()
+    assert "profile-1" not in manager._launching and "profile-1" not in manager.running
