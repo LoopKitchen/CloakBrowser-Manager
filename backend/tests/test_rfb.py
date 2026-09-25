@@ -52,63 +52,59 @@ def _make_extension_150() -> bytes:
     return struct.pack(">BBHHHH", 150, 1, 0, 0, 1920, 1080)
 
 
-def _make_kasmvnc_clipboard(mime: str, data: str) -> bytes:
-    """Build a KasmVNC BinaryClipboard message (type 180)."""
-    mime_bytes = mime.encode()
-    data_bytes = data.encode("utf-8")
-    buf = bytearray()
-    buf.append(180)       # type
-    buf.append(0)         # action
-    buf.extend(b'\x00' * 4)  # flags
-    buf.append(len(mime_bytes))  # mime_len (u8)
-    buf.extend(mime_bytes)
-    buf.extend(struct.pack(">I", len(data_bytes)))  # data_len (u32 BE)
-    buf.extend(data_bytes)
+def _make_kasmvnc_clipboard(*entries: tuple[str, bytes]) -> bytes:
+    """Build a KasmVNC BinaryClipboard message (type 180) in its real wire format:
+    type(1) count(1), then per entry id(4) mime_len(1) mime data_len(4) data."""
+    buf = bytearray([180, len(entries)])
+    for i, (mime, data) in enumerate(entries):
+        buf += struct.pack(">IB", i, len(mime)) + mime.encode() + struct.pack(">I", len(data)) + data
     return bytes(buf)
+
+
+# Captured from KasmVNC 1.3.3: Chrome copying "from-input" out of an <input>.
+_REAL_CLIPBOARD_INPUT = bytes.fromhex("b401000000000a746578742f706c61696e0000000a66726f6d2d696e707574")
 
 
 # ── _parse_kasmvnc_clipboard ────────────────────────────────────────────────
 
 
 def test_parse_clipboard_text_plain():
-    data = _make_kasmvnc_clipboard("text/plain", "hello")
+    data = _make_kasmvnc_clipboard(("text/plain", b"hello"))
     assert _parse_kasmvnc_clipboard(data) == "hello"
 
 
+def test_parse_clipboard_real_capture():
+    assert _parse_kasmvnc_clipboard(_REAL_CLIPBOARD_INPUT) == "from-input"
+
+
 def test_parse_clipboard_no_text_plain():
-    data = _make_kasmvnc_clipboard("image/png", "binary")
+    data = _make_kasmvnc_clipboard(("image/png", b"binary"))
     assert _parse_kasmvnc_clipboard(data) is None
 
 
 def test_parse_clipboard_too_short():
-    assert _parse_kasmvnc_clipboard(b"\xb4\x00\x00") is None
+    assert _parse_kasmvnc_clipboard(b"\xb4\x01\x00") is None
 
 
 def test_parse_clipboard_empty_text():
-    data = _make_kasmvnc_clipboard("text/plain", "")
+    data = _make_kasmvnc_clipboard(("text/plain", b""))
     assert _parse_kasmvnc_clipboard(data) == ""
 
 
 def test_parse_clipboard_multiple_mimes():
-    """First mime is image/png, second is text/plain — should find text/plain."""
-    buf = bytearray()
-    buf.append(180)
-    buf.append(0)
-    buf.extend(b'\x00' * 4)
-    # Entry 1: image/png
-    mime1 = b"image/png"
-    buf.append(len(mime1))
-    buf.extend(mime1)
-    buf.extend(struct.pack(">I", 3))
-    buf.extend(b"PNG")
-    # Entry 2: text/plain
-    mime2 = b"text/plain"
-    buf.append(len(mime2))
-    buf.extend(mime2)
-    text = b"world"
-    buf.extend(struct.pack(">I", len(text)))
-    buf.extend(text)
-    assert _parse_kasmvnc_clipboard(bytes(buf)) == "world"
+    """text/plain after another entry is found (each entry carries its own id)."""
+    data = _make_kasmvnc_clipboard(("text/html", b"<b>world</b>"), ("text/plain", b"world"))
+    assert _parse_kasmvnc_clipboard(data) == "world"
+
+
+def test_parse_clipboard_truncated_text_is_rejected():
+    data = _make_kasmvnc_clipboard(("text/plain", b"complete text"))
+    assert _parse_kasmvnc_clipboard(data[:-3]) is None
+
+
+def test_parse_clipboard_utf8():
+    data = _make_kasmvnc_clipboard(("text/plain", "café".encode()))
+    assert _parse_kasmvnc_clipboard(data) == "café"
 
 
 # ── _build_server_cut_text ───────────────────────────────────────────────────
@@ -276,16 +272,43 @@ def test_filter_keeps_standard_types():
     assert result[8:] == fb
 
 
-def test_filter_strips_extension_150():
+def test_filter_forwards_enable_continuous_updates():
     key1 = _make_key_event(down=1, key=0x61)
     ext = _make_extension_150()
     key2 = _make_key_event(down=0, key=0x61)
     data = key1 + ext + key2
-    result = _filter_rfb_client_messages(data)
-    # Extension stripped, both key events kept
-    assert len(result) == 16  # 8 + 8
-    assert result[:8] == key1
-    assert result[8:] == key2
+    assert _filter_rfb_client_messages(data) == data
+
+
+def _make_client_fence(payload: bytes = b"\x01\x02\x03\x04") -> bytes:
+    return struct.pack(">BxxxIB", 248, 0x00000001, len(payload)) + payload
+
+
+def test_rfb_len_client_fence():
+    assert _rfb_msg_length(_make_client_fence(), 0) == 13
+    assert _rfb_msg_length(_make_client_fence(b""), 0) == 9
+
+
+def test_filter_forwards_client_fence_between_messages():
+    """noVNC's fence reply is variable length; the next message must still be found."""
+    key = _make_key_event()
+    fence = _make_client_fence(b"abcdefgh")
+    req = _make_fb_update_request()
+    data = key + fence + req
+    assert _filter_rfb_client_messages(data) == data
+
+
+def test_rewrite_keeps_fence_and_continuous_updates():
+    data = _make_set_encodings([7, -312, -313])
+    assert _rewrite_set_encodings(data, 0, len(data)) == data
+
+
+def test_filter_reports_client_pixel_format():
+    pf = struct.pack(">BBBBHHHBBBxxx", 16, 16, 0, 1, 31, 63, 31, 11, 5, 0)
+    seen = []
+    data = b"\x00\x00\x00\x00" + pf + _make_key_event()
+    assert _filter_rfb_client_messages(data, seen.append) == data
+    assert seen == [pf]
 
 
 def test_filter_drops_unknown():
@@ -321,13 +344,13 @@ def test_filter_rewrites_set_encodings():
 
 
 def test_filter_mixed_frame():
-    """Realistic frame: KeyEvent + Extension + PointerEvent + ClientCutText."""
+    """Realistic frame: KeyEvent + unsupported xvp + PointerEvent + ClientCutText."""
     key = _make_key_event()        # 8 bytes, kept
-    ext = _make_extension_150()    # 10 bytes, stripped
+    xvp = bytes([252, 0, 1, 2])    # 4 bytes, stripped
     ptr = _make_pointer_event()    # 6 bytes → 11 bytes (rewritten)
     cut = _make_client_cut_text("hi")  # 8+2=10 bytes, kept
 
-    data = key + ext + ptr + cut
+    data = key + xvp + ptr + cut
     result = _filter_rfb_client_messages(data)
 
     # key(8) + ptr_rewritten(11) + cut(10) = 29
