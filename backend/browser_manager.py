@@ -95,6 +95,21 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing port: {url}")
 
 
+def _resolve_geoip_with_retries(
+    profile_id: str, proxy: str | None, timezone: str | None, locale: str | None, args: list[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Blocking GeoIP lookup, retried as often as the library's per-CDP-attempt lookups used to
+    be, so a proxy that is slow for one window still launches. Runs in a worker thread."""
+    for attempt in range(1, CDP_START_ATTEMPTS):
+        try:
+            return maybe_resolve_geoip(True, proxy, timezone, locale, args)
+        except Exception as exc:
+            logger.warning(
+                "GeoIP attempt %d/%d failed for %s: %s", attempt, CDP_START_ATTEMPTS, profile_id, exc
+            )
+    return maybe_resolve_geoip(True, proxy, timezone, locale, args)  # last try: its error ends the launch
+
+
 _WEBRTC_AUTO = "--fingerprint-webrtc-ip=auto"
 
 
@@ -540,7 +555,7 @@ class BrowserManager:
                 # loop, once per CDP attempt, freezing /api/health for up to 20s each. Resolve it
                 # once here in a thread and pass the result; the library then does no lookup.
                 timezone, locale, exit_ip = await asyncio.to_thread(
-                    maybe_resolve_geoip, True, proxy, timezone, locale, extra_args
+                    _resolve_geoip_with_retries, profile_id, proxy, timezone, locale, extra_args
                 )
             # Same order as the library: settle `auto`, then add the GeoIP exit IP if still unset.
             extra_args = await _resolve_webrtc_auto(extra_args, proxy, exit_ip)

@@ -822,8 +822,47 @@ async def test_a_failed_lookup_fails_the_launch_cleanly(monkeypatch, tmp_path: P
     manager, launch = _geo_manager(monkeypatch, resolve)
     with pytest.raises(RuntimeError, match="GeoIP resolution timed out"):
         await manager.launch(_geoip_profile(tmp_path))
+    # Retried as often as the old per-CDP-attempt lookups were, then given up.
+    assert resolve.call_count == 3
     launch.assert_not_awaited()
     assert "profile-1" not in manager._launching and "profile-1" not in manager.running
+
+
+@pytest.mark.asyncio
+async def test_a_transient_lookup_failure_is_retried_and_the_launch_succeeds(monkeypatch, tmp_path: Path):
+    """Parity with the old behaviour, where each CDP attempt redid the lookup: a proxy that is
+    slow for one window and recovers still launches."""
+    import threading
+
+    threads = []
+
+    def flaky(*_args):
+        threads.append(threading.get_ident())
+        if len(threads) == 1:
+            raise RuntimeError("GeoIP resolution timed out after 20.0s")
+        return _GEO
+
+    manager, launch = _geo_manager(monkeypatch, flaky)
+    await manager.launch(_geoip_profile(tmp_path))
+    assert len(threads) == 2
+    assert all(t != threading.get_ident() for t in threads)  # every try off the loop
+    options = launch.await_args.kwargs
+    assert options["timezone"] == "America/New_York" and "--fingerprint-webrtc-ip=203.0.113.7" in options["args"]
+
+
+@pytest.mark.asyncio
+async def test_retrying_a_slow_lookup_never_freezes_the_event_loop(monkeypatch, tmp_path: Path):
+    import time
+
+    def slow_then_fail(*_args):
+        time.sleep(0.25)
+        raise RuntimeError("GeoIP resolution timed out after 20.0s")
+
+    manager, _ = _geo_manager(monkeypatch, slow_then_fail)
+    async with _heartbeat() as ticks:
+        with pytest.raises(RuntimeError):
+            await manager.launch(_geoip_profile(tmp_path))
+    assert ticks[0] >= 6  # three 0.25s tries = 0.75s: ~37 ticks at 20ms; a blocked loop gets ~0
 
 
 # ── --fingerprint-webrtc-ip=auto ─────────────────────────────────────────────
