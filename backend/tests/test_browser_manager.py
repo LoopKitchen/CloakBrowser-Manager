@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -743,7 +744,7 @@ async def test_geoip_is_resolved_off_the_loop_and_the_library_skips_it(monkeypat
 
 @pytest.mark.asyncio
 async def test_a_slow_lookup_does_not_freeze_the_event_loop(monkeypatch, tmp_path: Path):
-    """The shard-killing symptom: /api/health (any coroutine) must keep running while GeoIP resolves."""
+    """The symptom: /api/health (any coroutine) must keep running while GeoIP resolves."""
     import time
 
     def slow_resolve(*_args):
@@ -1016,3 +1017,44 @@ async def test_a_failed_lookup_with_repeated_auto_flags_drops_all_of_them(monkey
 
     assert not any(a.startswith("--fingerprint-webrtc-ip") for a in launch.await_args.kwargs["args"])
     assert [t != threading.get_ident() for _p, t in webrtc_resolver.webrtc_lookups] == [True]
+
+
+
+@pytest.mark.asyncio
+async def test_every_failed_geoip_attempt_is_logged(monkeypatch, tmp_path: Path, caplog):
+    import logging
+
+    resolve = MagicMock(side_effect=RuntimeError("GeoIP resolution timed out after 20.0s"))
+    manager, _ = _geo_manager(monkeypatch, resolve)
+    with caplog.at_level(logging.WARNING, logger="cloakbrowser.manager.browser"):
+        with pytest.raises(RuntimeError):
+            await manager.launch(_geoip_profile(tmp_path))
+    logged = [r.getMessage() for r in caplog.records if "GeoIP attempt" in r.getMessage()]
+    assert [m.split(" failed")[0] for m in logged] == ["GeoIP attempt 1/3", "GeoIP attempt 2/3", "GeoIP attempt 3/3"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_launch_stops_further_geoip_attempts(monkeypatch, tmp_path: Path):
+    """Each try runs in its own worker thread, so a cancelled launch starts no further tries (the
+    in-flight one finishes in its thread, but nothing is retried after it)."""
+    import threading
+
+    started = threading.Event()
+    calls = []
+
+    def slow_failing(*_args):
+        calls.append(1)
+        started.set()
+        time.sleep(0.3)
+        raise RuntimeError("GeoIP resolution timed out after 20.0s")
+
+    manager, launch = _geo_manager(monkeypatch, slow_failing)
+    task = asyncio.create_task(manager.launch(_geoip_profile(tmp_path)))
+    await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.8)  # long enough for tries 2 and 3 to have started if anything retried
+    assert len(calls) == 1
+    launch.assert_not_awaited()
+    assert "profile-1" not in manager._launching
