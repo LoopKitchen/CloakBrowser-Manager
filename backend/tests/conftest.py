@@ -52,6 +52,8 @@ def _append_webrtc_exit_ip(args, exit_ip):
 
 
 _mock_browser._append_webrtc_exit_ip = _append_webrtc_exit_ip  # type: ignore[attr-defined]
+# Real rule: replace `--fingerprint-webrtc-ip=auto` with the proxy exit IP, or drop it. Tests patch it.
+_mock_browser._resolve_webrtc_args = lambda args, proxy: args  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
 sys.modules.setdefault("cloakbrowser.browser", _mock_browser)

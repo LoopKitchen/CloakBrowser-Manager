@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
-from cloakbrowser.browser import _append_webrtc_exit_ip, maybe_resolve_geoip
+from cloakbrowser.browser import _append_webrtc_exit_ip, _resolve_webrtc_args, maybe_resolve_geoip
 from cloakbrowser.license import (
     CloakBrowserLicenseError,
     license_error_for_code,
@@ -93,6 +93,23 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+_WEBRTC_AUTO = "--fingerprint-webrtc-ip=auto"
+
+
+async def _resolve_webrtc_auto(args: list[str], proxy: str | None, exit_ip: str | None) -> list[str]:
+    """Settle ``--fingerprint-webrtc-ip=auto`` before launch so the library never sees it.
+
+    The library resolves ``auto`` with its own blocking exit-IP lookup on the event loop, even
+    with geoip=False. With a proxy and a GeoIP exit IP already in hand, that IP is the answer
+    (no second lookup); otherwise the library's own rule runs in a thread.
+    """
+    if _WEBRTC_AUTO not in args:
+        return args
+    if exit_ip and proxy:
+        return [f"--fingerprint-webrtc-ip={exit_ip}" if a == _WEBRTC_AUTO else a for a in args]
+    return await asyncio.to_thread(_resolve_webrtc_args, args, proxy) or []
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -511,6 +528,7 @@ class BrowserManager:
 
             timezone = profile.get("timezone") or None
             locale = profile.get("locale") or None
+            exit_ip = None
             if profile.get("geoip", False):
                 # cloakbrowser's async launcher resolves GeoIP with a blocking call ON this event
                 # loop, once per CDP attempt, freezing /api/health for up to 20s each. Resolve it
@@ -518,7 +536,9 @@ class BrowserManager:
                 timezone, locale, exit_ip = await asyncio.to_thread(
                     maybe_resolve_geoip, True, proxy, timezone, locale, extra_args
                 )
-                extra_args = _append_webrtc_exit_ip(extra_args, exit_ip) or extra_args
+            # Same order as the library: settle `auto`, then add the GeoIP exit IP if still unset.
+            extra_args = await _resolve_webrtc_auto(extra_args, proxy, exit_ip)
+            extra_args = _append_webrtc_exit_ip(extra_args, exit_ip) or extra_args
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],

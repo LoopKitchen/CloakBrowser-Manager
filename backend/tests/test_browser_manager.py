@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -683,6 +684,26 @@ def _geoip_profile(tmp_path: Path) -> dict:
     return profile
 
 
+@contextlib.asynccontextmanager
+async def _heartbeat():
+    """Counts event-loop ticks while the body runs; a blocked loop barely ticks. The task is
+    cancelled and awaited on every exit path, so it never outlives the test."""
+    ticks = [0]
+
+    async def beat():
+        while True:
+            await asyncio.sleep(0.05)
+            ticks[0] += 1
+
+    task = asyncio.create_task(beat())
+    try:
+        yield ticks
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def _geo_manager(monkeypatch, resolve, launch=None, wait_for_cdp=None):
     from backend import browser_manager as module
 
@@ -738,18 +759,9 @@ async def test_a_slow_lookup_does_not_freeze_the_event_loop(monkeypatch, tmp_pat
         return context
 
     manager, _ = _geo_manager(monkeypatch, slow_resolve, launch=AsyncMock(side_effect=blocking_library_launch))
-    ticks = 0
-
-    async def heartbeat():
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.05)
-            ticks += 1
-
-    beat = asyncio.create_task(heartbeat())
-    await manager.launch(_geoip_profile(tmp_path))
-    beat.cancel()
-    assert ticks >= 6  # ~12 expected over 0.6s; a blocked loop gets ~0
+    async with _heartbeat() as ticks:
+        await manager.launch(_geoip_profile(tmp_path))
+    assert ticks[0] >= 6  # ~12 expected over 0.6s; a blocked loop gets ~0
 
 
 @pytest.mark.asyncio
@@ -812,3 +824,93 @@ async def test_a_failed_lookup_fails_the_launch_cleanly(monkeypatch, tmp_path: P
         await manager.launch(_geoip_profile(tmp_path))
     launch.assert_not_awaited()
     assert "profile-1" not in manager._launching and "profile-1" not in manager.running
+
+
+# ── --fingerprint-webrtc-ip=auto ─────────────────────────────────────────────
+# The library resolves `auto` with its own blocking lookup (_resolve_webrtc_args), even with
+# geoip=False. The Manager resolves it before launch so the library never sees `auto`.
+
+_AUTO = "--fingerprint-webrtc-ip=auto"
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_uses_the_geoip_exit_ip_without_a_second_lookup(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    second_lookup = MagicMock()
+    monkeypatch.setattr(module, "_resolve_webrtc_args", second_lookup)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile["launch_args"] = [_AUTO]
+    await manager.launch(profile)
+
+    second_lookup.assert_not_called()
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args
+    assert [a for a in args if a.startswith("--fingerprint-webrtc-ip")] == ["--fingerprint-webrtc-ip=203.0.113.7"]
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_without_geoip_is_resolved_off_the_loop(monkeypatch, tmp_path: Path):
+    import threading
+    import time
+
+    from backend import browser_manager as module
+
+    seen = []
+
+    def slow_resolve_webrtc(args, proxy):
+        seen.append((proxy, threading.get_ident()))
+        time.sleep(0.6)
+        return ["--fingerprint-webrtc-ip=198.51.100.4" if a == _AUTO else a for a in args]
+
+    async def blocking_library_launch(**kwargs):
+        # The real library blocks the loop when it is handed `auto` to resolve.
+        if _AUTO in kwargs["args"]:
+            time.sleep(0.6)
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    monkeypatch.setattr(module, "_resolve_webrtc_args", slow_resolve_webrtc)
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve, launch=AsyncMock(side_effect=blocking_library_launch))
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO])
+    async with _heartbeat() as ticks:
+        await manager.launch(profile)
+
+    resolve.assert_not_called()
+    assert len(seen) == 1 and seen[0][0] == "http://user:pass@proxy.example:33335"
+    assert seen[0][1] != threading.get_ident()
+    assert ticks[0] >= 6
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args and "--fingerprint-webrtc-ip=198.51.100.4" in args
+
+
+@pytest.mark.asyncio
+async def test_a_failed_webrtc_auto_lookup_drops_the_flag_and_still_launches(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    # The library's own rule on a failed lookup: remove `auto` rather than fail the launch.
+    monkeypatch.setattr(module, "_resolve_webrtc_args", lambda args, proxy: [a for a in args if a != _AUTO])
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO])
+    await manager.launch(profile)
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in launch.await_args.kwargs["args"])
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_without_a_proxy_defers_to_the_library_rule(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    rule = MagicMock(side_effect=lambda args, proxy: [a for a in args if a != _AUTO])
+    monkeypatch.setattr(module, "_resolve_webrtc_args", rule)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile.update(proxy=None, launch_args=[_AUTO])
+    await manager.launch(profile)
+    # With no proxy the machine's own IP is what sites see; the library just removes `auto`.
+    rule.assert_called_once()
+    assert _AUTO not in launch.await_args.kwargs["args"]
