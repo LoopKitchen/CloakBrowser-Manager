@@ -345,3 +345,13 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 - **Website** — [cloakbrowser.dev](https://cloakbrowser.dev)
 - **Bug reports** — [GitHub Issues](https://github.com/CloakHQ/CloakBrowser-Manager/issues)
 - **Contact** — cloakhq@pm.me
+
+### Export browser state
+
+`POST /api/profiles/{id}/export` downloads a ZIP for a stopped Linux/Docker profile. `AUTH_TOKEN` must be configured; portable export refuses native profiles because their cookie keys are tied to the source OS/user. It uses the normal Manager authentication and returns 409 if the browser is running/launching/closing or another filesystem operation holds it. It never stops a browser automatically.
+
+The ZIP contains `user-data/` (cookies, Local Storage, IndexedDB, Local State, history) and `profile.json` (format `cloak-profile-v1`, browser build, host OS, seed, fingerprint flags, and selected nonsecret launch settings). Proxy passwords, notes, external extensions and Manager-managed uploads/downloads are not exported. Unsupported custom launch arguments refuse export (409); platform and WebRTC-IP fingerprint overrides are preserved. Process locks, preview files and symlinks are excluded.
+
+Extract into a fresh private directory. Launch a compatible Cloak binary with `--user-data-dir=<directory>/user-data` and the manifest's `fingerprint_args`; apply timezone/locale/color scheme and the `geoip` setting via the Cloak SDK when supplied. GeoIP-derived values are recomputed at import, so use the same assigned proxy IP to reproduce them. Proxy credentials are configured separately. Cross-OS cookie-keyring portability is not guaranteed; Linux Docker exports use the basic password store. These are copies of existing login credentials, not independently revocable sessions.
+
+ZIP creation runs off the event loop while the source is reserved. The reservation survives cancellation until the filesystem worker completes. Temporary files are deleted after delivery, response disconnect or creation failure. At most two archives can be in creation or delivery; a slot is released only after its temporary ZIP is removed. Unreadable browser-state directories abort the export. `CLOAK_PROFILE_EXPORT_MAX_BYTES` limits both source bytes and compressed ZIP size (default 512 MiB; 0 disables export; a malformed setting returns 503).

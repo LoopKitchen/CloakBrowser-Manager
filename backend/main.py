@@ -805,6 +805,23 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
     return _profile_response(clone)
 
 
+@app.post("/api/profiles/{profile_id}/export")
+async def export_profile(profile_id: str):
+    """Export a stopped profile's storage and nonsecret launch manifest as a ZIP."""
+    from .profile_exports import snapshot
+
+    if not AUTH_TOKEN:
+        raise HTTPException(503, "Configure Manager authentication before exporting profiles")
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            profile = db.get_profile(profile_id)
+            if profile is None:
+                raise HTTPException(404, "Profile not found")
+            return await snapshot(profile, browser_mgr, set(_DUPLICATE_SKIP_FILES) | {"DevToolsActivePort"})
+    except ProfileBusyError as exc:
+        raise HTTPException(409, "Stop the profile before exporting its browser state") from exc
+
+
 # ── Profile files ────────────────────────────────────────────────────────────
 
 
