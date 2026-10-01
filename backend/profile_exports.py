@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import ipaddress
+import json
 import os
 import shutil
 import stat
@@ -19,11 +19,35 @@ _SLOTS = asyncio.Semaphore(2)
 
 
 class ArchiveResponse(FileResponse):
+    def __init__(self, *args, slot: asyncio.Semaphore, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slot = slot
+
     async def __call__(self, scope, receive, send):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            await asyncio.to_thread(shutil.rmtree, Path(self.path).parent, True)
+            try:
+                await _discard_archive(Path(self.path))
+            finally:
+                self._slot.release()
+
+
+async def _discard_archive(path: Path):
+    cleanup = asyncio.create_task(asyncio.to_thread(shutil.rmtree, path.parent, True))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _scan_failed(error: OSError):
+    raise error
 
 
 def _build(root: Path, manifest: dict, skip: set[str], limit: int) -> Path:
@@ -35,7 +59,7 @@ def _build(root: Path, manifest: dict, skip: set[str], limit: int) -> Path:
         total = 0
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:
             out.writestr("profile.json", json.dumps(manifest, indent=2))
-            for parent, dirs, files in os.walk(root, followlinks=False):
+            for parent, dirs, files in os.walk(root, followlinks=False, onerror=_scan_failed):
                 dirs[:] = [d for d in dirs if d not in skip and not (Path(parent) / d).is_symlink()]
                 for name in files:
                     file = Path(parent) / name
@@ -55,7 +79,10 @@ def _build(root: Path, manifest: dict, skip: set[str], limit: int) -> Path:
 
 
 async def snapshot(profile: dict, manager, skip: set[str]) -> ArchiveResponse:
-    limit = int(os.environ.get("CLOAK_PROFILE_EXPORT_MAX_BYTES", 512 * 1024 * 1024))
+    try:
+        limit = int(os.environ.get("CLOAK_PROFILE_EXPORT_MAX_BYTES", 512 * 1024 * 1024))
+    except ValueError:
+        raise HTTPException(503, "Profile export size limit must be an integer") from None
     if limit <= 0:
         raise HTTPException(503, "Profile exports are disabled")
     if manager.runtime.host_os != "linux" or manager.runtime.runtime_mode != "docker":
@@ -95,7 +122,9 @@ async def snapshot(profile: dict, manager, skip: set[str]) -> ArchiveResponse:
             )
         },
     }
-    async with _SLOTS:
+    slots = _SLOTS
+    await slots.acquire()
+    try:
         task = asyncio.create_task(asyncio.to_thread(_build, Path(profile["user_data_dir"]), manifest, skip, limit))
         cancelled = False
         while not task.done():
@@ -108,11 +137,15 @@ async def snapshot(profile: dict, manager, skip: set[str]) -> ArchiveResponse:
                     raise
         if cancelled:
             if not task.cancelled() and task.exception() is None:
-                await asyncio.to_thread(shutil.rmtree, task.result().parent, True)
+                await _discard_archive(task.result())
             raise asyncio.CancelledError
         return ArchiveResponse(
             task.result(),
+            slot=slots,
             media_type="application/zip",
             filename="cloak-profile.zip",
             headers={"Cache-Control": "no-store"},
         )
+    except BaseException:
+        slots.release()
+        raise

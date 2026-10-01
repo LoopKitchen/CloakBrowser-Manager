@@ -88,6 +88,7 @@ def test_export_enforces_size_limit(app_client, sample_profile, monkeypatch):
 async def test_cancelled_export_holds_source_until_worker_finishes(sample_profile, monkeypatch):
     import asyncio
     import threading
+
     from backend import main, profile_exports
     from backend.browser_manager import ProfileBusyError
 
@@ -187,3 +188,147 @@ def test_export_preserves_geoip_and_safe_custom_flags(app_client, sample_profile
         assert m["fingerprint_args"][-2:] == ["--fingerprint-platform=macos", "--fingerprint-webrtc-ip=auto"]
     db.update_profile(sample_profile["id"], launch_args=["--proxy-server=secret"])
     assert app_client.post(f"/api/profiles/{sample_profile['id']}/export").status_code == 409
+
+
+@pytest.mark.parametrize("limit", ["not-an-integer", "0", "-1"])
+def test_invalid_export_limit_is_unavailable(app_client, sample_profile, monkeypatch, limit):
+    seed_state(sample_profile)
+    monkeypatch.setenv("CLOAK_PROFILE_EXPORT_MAX_BYTES", limit)
+    assert app_client.post(f"/api/profiles/{sample_profile['id']}/export").status_code == 503
+
+
+def test_export_aborts_and_cleans_archive_on_scan_error(app_client, sample_profile, monkeypatch, tmp_path):
+    from backend import profile_exports
+
+    root = seed_state(sample_profile)
+    directory = tmp_path / "failed-export"
+
+    def make_directory(**kwargs):
+        directory.mkdir()
+        return str(directory)
+
+    def unreadable_walk(path, *, followlinks, onerror=None):
+        yield str(root), [], ["Local State"]
+        if onerror is not None:
+            onerror(PermissionError("browser storage directory is unreadable"))
+
+    monkeypatch.setattr(profile_exports.tempfile, "mkdtemp", make_directory)
+    monkeypatch.setattr(profile_exports.os, "walk", unreadable_walk)
+    with pytest.raises(PermissionError, match="browser storage directory is unreadable"):
+        app_client.post(f"/api/profiles/{sample_profile['id']}/export")
+    assert not directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_slow_downloads_bound_archives_until_response_cleanup(sample_profile, monkeypatch):
+    import asyncio
+
+    from backend import main, profile_exports
+
+    seed_state(sample_profile)
+    monkeypatch.setattr(profile_exports, "_SLOTS", asyncio.Semaphore(2))
+    first = await main.export_profile(sample_profile["id"])
+    second = await main.export_profile(sample_profile["id"])
+    third = asyncio.create_task(main.export_profile(sample_profile["id"]))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def receive():
+        return {"type": "http.request"}
+
+    async def slow_disconnect(message):
+        entered.set()
+        await release.wait()
+        raise OSError("client disconnected")
+
+    async def consume(message):
+        pass
+
+    scope = {"type": "http", "method": "POST", "extensions": {}, "headers": []}
+    download = asyncio.create_task(first(scope, receive, slow_disconnect))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(0.05)
+        assert not third.done(), "A third archive must wait while two downloads retain their ZIPs"
+        assert Path(first.path).exists() and Path(second.path).exists()
+        release.set()
+        with pytest.raises(OSError, match="client disconnected"):
+            await download
+        assert not Path(first.path).parent.exists()
+        last = await asyncio.wait_for(third, 2)
+        await second(scope, receive, consume)
+        await last(scope, receive, consume)
+        assert not Path(second.path).parent.exists() and not Path(last.path).parent.exists()
+    finally:
+        release.set()
+        if not download.done():
+            await asyncio.gather(download, return_exceptions=True)
+        if not third.done():
+            third.cancel()
+        results = await asyncio.gather(third, return_exceptions=True)
+        if Path(second.path).exists():
+            await second(scope, receive, consume)
+        if not isinstance(results[0], BaseException) and Path(results[0].path).exists():
+            await results[0](scope, receive, consume)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_keeps_slot_until_archive_removed(sample_profile, monkeypatch):
+    import asyncio
+    import threading
+
+    from backend import main, profile_exports
+
+    seed_state(sample_profile)
+    slots = asyncio.Semaphore(1)
+    monkeypatch.setattr(profile_exports, "_SLOTS", slots)
+    response = await main.export_profile(sample_profile["id"])
+    entered, release = threading.Event(), threading.Event()
+    original = profile_exports.shutil.rmtree
+
+    def delayed_cleanup(*args):
+        entered.set()
+        release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(profile_exports.shutil, "rmtree", delayed_cleanup)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    async def consume(message):
+        pass
+
+    scope = {"type": "http", "method": "POST", "extensions": {}, "headers": []}
+    task = asyncio.create_task(response(scope, receive, consume))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert slots.locked() and Path(response.path).exists()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not slots.locked() and not Path(response.path).parent.exists()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_build_releases_archive_slot(sample_profile, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from backend import main, profile_exports
+
+    seed_state(sample_profile)
+    slots = asyncio.Semaphore(1)
+    monkeypatch.setattr(profile_exports, "_SLOTS", slots)
+    monkeypatch.setenv("CLOAK_PROFILE_EXPORT_MAX_BYTES", "8")
+    with pytest.raises(HTTPException) as error:
+        await main.export_profile(sample_profile["id"])
+    assert error.value.status_code == 413
+    assert not slots.locked()
